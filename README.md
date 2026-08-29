@@ -16,7 +16,7 @@
 ## 安装使用
 
 ### 1. 下载安装程序
-- [VRChat_OSC_Chatbox_Setup_v4.exe](computer://d:\vrcosc1\VRChat_OSC_Chatbox_Setup_v4.exe)（238.7 MB）
+- [VRChat_OSC_Chatbox_Setup_v4.exe](https://github.com/Txaniag/VRChat-OSC-Chatbox/releases/download/v4.0/VRChat_OSC_Chatbox_Setup_v4.exe)（238.7 MB）
 
 ### 2. 运行应用
 - 双击安装程序，按向导完成安装
