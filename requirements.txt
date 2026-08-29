@@ -1,0 +1,7 @@
+PyQt5>=5.15
+python-osc>=1.8
+sherpa-onnx>=1.13
+soundfile>=0.12
+pyaudio>=0.2.14
+numpy>=1.24
+pyinstaller>=6.0

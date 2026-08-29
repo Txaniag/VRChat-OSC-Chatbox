@@ -1,0 +1,311 @@
+================================================================================
+  VRChat OSC Chatbox Sender - 项目上下文与开发说明
+================================================================================
+
+【最后更新】2026-08-28
+【版本】4.0.0
+【开发者】用户 + AI 辅助开发
+
+================================================================================
+一、项目概述
+================================================================================
+
+这是一个 Windows 桌面应用程序，用于通过 OSC 协议向 VRChat 聊天框发送文字消息。
+支持手动打字输入和语音识别输入两种方式，语音识别完全离线运行，不需要联网。
+
+核心功能：
+  1. 文字输入框 -> 通过 OSC 协议发送到 VRChat 聊天框 (/chatbox/input)
+  2. 语音识别 -> 使用 SenseVoice 模型离线识别中/英/日/韩/粤语
+  3. VAD 语音活动检测 -> 说完话自动截断并识别，可自动发送
+  4. 全局热键 -> 在任何界面（包括游戏内）按住/切换按键控制录音
+  5. 横屏/竖屏布局切换 -> 竖屏单列，横屏左右双列（左操作右历史）
+  6. 设置面板 -> 可调字体大小、VAD参数、最大字符数等
+  7. 历史记录 -> 双击可重新填入
+
+================================================================================
+二、技术栈
+================================================================================
+
+  - Python 3.10
+  - PyQt5          (GUI 界面)
+  - python-osc     (OSC 协议通信)
+  - sherpa-onnx    (语音识别引擎 + VAD 语音活动检测)
+  - pyaudio        (麦克风音频采集)
+  - numpy          (音频数据处理)
+  - keyboard       (全局热键监听)
+  - PyInstaller    (打包为 EXE)
+
+================================================================================
+三、硬性约束（必须遵守）
+================================================================================
+
+  1. 完全离线：由于在中国大陆使用，不能用 Google 等在线语音识别 API
+     -> 必须使用本地模型 (SenseVoice int8, 228MB)
+     -> 所有依赖（原生 DLL + 模型文件）必须打包进单个 EXE
+
+  2. 语音识别精度：用户要求高精度
+     -> 使用 SenseVoiceSmall int8 模型，支持中/英/日/韩/粤语
+     -> VAD 使用 Silero 模型做端点检测
+
+  3. 免手动操作：用户希望说话后自动发送，不需要点按钮
+     -> 连续监听模式 + VAD 自动端点检测 + "识别后自动发送"选项
+
+  4. 全局热键：用户需要在 VRChat 游戏内也能触发语音录音
+     -> 使用 keyboard 库注册全局热键
+     -> 支持按住说话(hold)和按键切换(toggle)两种模式
+     -> 注意：游戏内热键可能需要管理员权限运行 EXE
+
+  5. 打包为单一 EXE：用户明确要求 EXE 而非开发模式
+     -> 使用 PyInstaller --onefile 模式
+     -> 模型文件通过 --add-data 打包进 EXE
+
+================================================================================
+四、文件结构
+================================================================================
+
+  d:\vrcosc1\
+    ├── vrc_osc_chat.py              主程序源码（所有逻辑在此文件）
+    ├── VRChat_OSC_Chatbox.exe       打包后的 EXE（最终交付物）
+    ├── config.json                  用户设置（自动生成，保存IP/端口/热键/布局等）
+    ├── history.json                 发送历史（自动生成）
+    ├── sxw.txt                      本文件（项目说明）
+    ├── requirements.txt             Python 依赖列表
+    ├── models/
+    │   ├── silero_vad.onnx                       VAD 语音活动检测模型
+    │   └── sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/
+    │       ├── model.int8.onnx                  SenseVoice 语音识别模型 (228MB)
+    │       └── tokens.txt                       模型词汇表
+    ├── build/                       PyInstaller 构建临时目录
+    └── dist/                        PyInstaller 输出目录
+
+================================================================================
+五、关键代码结构（vrc_osc_chat.py）
+================================================================================
+
+  类/模块             说明
+  ------------------ --------------------------------------------------------
+  OSCSender           OSC 发送器，封装 python-osc 的 UDP 客户端
+  list_microphones()  枚举系统可用麦克风设备
+  SettingsDialog      设置对话框（横竖屏、字体大小、VAD参数、最大字符数）
+  VoiceEngine         语音引擎核心，QObject 子类
+    - _init_models()  延迟加载 sherpa-onnx 模型和 VAD
+    - start_ptt()     开始按键录音模式
+    - start_continuous() 开始连续监听模式
+    - _ptt_worker()   PTT 模式后台线程：录音 -> 停止 -> 识别
+    - _continuous_worker() 连续模式后台线程：VAD 检测 -> 自动识别
+    - 信号: partialResult, finalResult, status, error, vadState, pttFinished
+  MainWindow          主窗口，QMainWindow 子类
+    - _create_widgets()   创建所有控件（不组装布局）
+    - _apply_layout()     根据横竖屏模式组装布局
+    - _build_portrait()   竖屏布局：单列 + ScrollArea
+    - _build_landscape()  横屏布局：QSplitter 左右双列
+    - _apply_font_size()  动态调整全局字体大小
+    - _open_settings()    打开设置对话框
+    - 热键相关: _capture_hotkey, _start_hotkey_hook, _on_hotkey_press/release
+    - 语音回调: _on_partial, _on_final, _on_vad_state, _on_ptt_finished
+    - 配置: _load_config, _save_config
+
+================================================================================
+六、重要技术注意事项（踩过的坑）
+================================================================================
+
+  1. sherpa-onnx API 调用方式：
+     - 错误写法: recognizer.get_result(stream)  -> 不存在此方法
+     - 正确写法: recognizer.decode_stream(stream); text = stream.result.text
+     - 必须先 create_stream() -> accept_waveform() -> decode_stream() -> stream.result.text
+
+  2. VAD (Silero) 使用方式：
+     - VadModelConfig 配置参数: threshold, min_silence_duration, min_speech_duration
+     - VoiceActivityDetector 的 buffer_size_in_seconds=60
+     - 流程: vad.accept_waveform(samples) -> 检测 vad.is_speech_detected()
+     - 取出语音段: while not vad.empty(): seg = vad.front; audio = seg.samples; vad.pop()
+     - 停止时: vad.flush() 再取出剩余
+
+  3. PyInstaller 打包：
+     - 必须 --collect-all sherpa_onnx 和 --collect-all onnxruntime
+     - 模型文件通过 --add-data 单独添加
+     - onefile 模式下模型解压到 sys._MEIPASS，配置/历史写到 sys.executable 同目录
+     - 资源路径用 resource_dir() (打包资源) 和 app_dir() (用户数据) 区分
+
+  4. 全局热键 keyboard 库：
+     - keyboard.on_press_key(scan_code, callback) / on_release_key(scan_code, callback)
+     - 捕获按键时用 keyboard.hook() 监听所有按键
+     - 按键自动重复问题：用 _hotkey_key_down 标志位防抖
+     - 修饰键(Shift/Ctrl/Alt)单独按下时忽略，不设为热键
+     - ESC 键用于取消热键捕获
+
+  5. 音频参数：
+     - 采样率 16000Hz，单声道，16bit (pyaudio.paInt16)
+     - FRAMES_PER_BUFFER = 512 (Silero VAD 硬性要求)
+     - 识别前将 int16 转 float32: samples.astype(np.float32) / 32768.0
+
+  6. PyQt5 线程安全：
+     - VoiceEngine 在后台线程运行，通过 Qt 信号把结果传回主线程
+     - QTimer.singleShot(0, callback) 用于从 keyboard 回调线程安全调用 GUI 方法
+
+================================================================================
+七、当前完成进度
+================================================================================
+
+  [已完成] v1.0 - 基础功能
+    ✅ 文字输入框 + OSC 发送到 VRChat /chatbox/input
+    ✅ OSC 连接设置（IP/端口）
+    ✅ 立即发送/提示音选项
+    ✅ 字符计数 (默认144上限)
+    ✅ 发送历史记录（双击重新填入）
+    ✅ Ctrl+Enter 快捷发送
+    ✅ 打字状态通知 (/chatbox/typing)
+
+  [已完成] v2.0 - 语音识别
+    ✅ 按住说话(PTT)模式：点击按钮开始录音，再点击停止并识别
+    ✅ 连续监听模式：VAD 自动检测语音端点，说完自动识别
+    ✅ 识别后自动发送选项
+    ✅ 麦克风设备选择
+    ✅ 语言选择（自动/中/英/日/韩/粤）
+    ✅ VAD 说话状态实时显示
+    ✅ SenseVoice int8 模型离线识别
+    ✅ Silero VAD 端点检测
+
+  [已完成] v3.0 - 全局热键
+    ✅ 全局热键启用/禁用开关
+    ✅ 按键捕获（点击按钮后按任意键，ESC取消）
+    ✅ 按住说话模式（按住按键录音，松开识别）
+    ✅ 按键切换模式（按一下开始，再按一下停止）
+    ✅ 热键录音时按钮变红色视觉提示
+    ✅ 防按键自动重复
+    ✅ 热键设置保存到 config.json
+
+  [已完成] v4.0 - 横竖屏 + 设置面板
+    ✅ 竖屏模式（单列布局，ScrollArea 包裹）
+    ✅ 横屏模式（QSplitter 左右双列，左操作区右历史）
+    ✅ 设置对话框（横竖屏切换、字体大小、VAD参数、最大字符数）
+    ✅ VAD 参数可调（灵敏度阈值、静音截断时长、最短语音时长）
+    ✅ 字体大小可调（8-16pt 滑块）
+    ✅ 所有设置持久化到 config.json
+
+  [已完成] v4.0.1 - UI 优化
+    ✅ 全局字体从 10pt 缩小到 9pt
+    ✅ 所有按钮/输入框/间距/边距全面缩小
+    ✅ 窗口默认尺寸调整为 600x780（竖屏）/ 1000x640（横屏）
+    ✅ GroupBox padding/margin 缩小
+    ✅ 滚动条宽度缩小
+    ✅ 修复首次打开显示不全的问题
+
+  [已完成] v4.1 - Apple 风格 UI 重构
+    ✅ Bento Grid 卡片式布局（圆角 20px）
+    ✅ 淡绿色极光背景（径向渐变光球）
+    ✅ 毛玻璃半透明卡片
+    ✅ 按钮统一 12px 圆角（替代胶囊形）
+    ✅ 品牌绿 #2da44e 主色调
+    ✅ 修复文字溢出 UI 问题
+
+  [已完成] v5.0 - 百度翻译功能
+    ✅ BaiduTranslator 类（双模式）
+       - 模式1: 百度官方 API（需 AppID+密钥，设置里填）
+       - 模式2: MyMemory 免费备用（免注册，默认）
+    ✅ 消息区新增翻译行: 🌐翻译开关 + 目标语言(12种) + 显示方式
+    ✅ 显示方式: 双语显示（原文+译文）/ 仅译文
+    ✅ 设置对话框新增"翻译设置"组（含百度 API 凭据输入）
+    ✅ 双语超长自动回退为仅译文
+    ✅ 翻译失败自动发送原文（不卡流程）
+    ✅ 语音自动发送路径同样支持翻译
+    ✅ 源语言自动跟随语音识别语言
+    ✅ 所有翻译设置持久化到 config.json
+    ✅ 注意: 百度网页接口(transapi)有反爬限制(errno 1022)不可用
+            必须用官方 API 或 MyMemory 备用
+
+  [已完成] v4.2 - 安装程序
+    ✅ Inno Setup 7.1.0 已安装 (C:\Program Files\Inno Setup 7)
+    ✅ PyInstaller 文件夹模式 (VRChat_OSC_Chatbox.spec)
+       - 启动比单文件快（不用解压临时目录）
+    ✅ 单文件测试模式 (VRChat_OSC_Chatbox_onefile.spec)
+    ✅ installer.iss 安装脚本
+       - 中文安装向导
+       - 桌面快捷方式（可选）
+       - 开机自启动（可选）
+       - 完整卸载（清理 config/history）
+       - LZMA2 Ultra 压缩: 570MB → 238.7MB
+    ✅ 注意: installer_output 目录可能被杀毒软件锁定
+            报 Error 32 时改用 OutputDir=. 输出到根目录
+
+  [待做] 图标
+    ☐ 用户提供了图标路径: C:\Users\Tx\Pictures\022055yAzJW0K0KI1LgdGG.png
+    ☐ 需要将 PNG 转为 ICO 并在 PyInstaller 打包时指定 --icon
+
+================================================================================
+八、打包命令
+================================================================================
+
+  cd d:\vrcosc1
+
+  --- 测试用单文件 EXE（用户先测试）---
+  python -m PyInstaller VRChat_OSC_Chatbox_onefile.spec --noconfirm
+  复制 dist\VRChat_OSC_Chatbox.exe 到根目录
+
+  --- 正式安装程序（用户说打包才打包）---
+  步骤1: python -m PyInstaller VRChat_OSC_Chatbox.spec --noconfirm
+         （文件夹模式，dist\VRChat_OSC_Chatbox\）
+  步骤2: & 'C:\Program Files\Inno Setup 7\ISCC.exe' installer.iss
+         （编译安装程序到 d:\vrcosc1\VRChat_OSC_Chatbox_Setup_v4.exe）
+
+  单文件 EXE 约 296MB（模型占 228MB）
+  安装程序约 238.7MB（LZMA2 压缩后）
+
+================================================================================
+九、用户偏好
+================================================================================
+
+  - 交流语言：中文
+  - 交付格式：EXE 可执行文件（不要开发模式预览）
+  - 语音识别：要求高精度本地模型
+  - 语音交互：偏好免手动操作（自动发送，不需要点按钮）
+  - 熟悉 Electron 应用开发流程
+  - 需要明确反馈问题解决状态
+
+================================================================================
+十、已知问题与未来改进方向
+================================================================================
+
+  1. EXE 体积较大 (~296MB)：主要因为 SenseVoice 模型 228MB
+     -> 可考虑量化更小的模型，但会降低精度
+
+  2. 全局热键在游戏内可能不生效：
+     -> 需要以管理员身份运行 EXE
+     -> keyboard 库在部分游戏全屏模式下可能被拦截
+
+  3. 首次打开模型加载较慢 (约2-3秒)：
+     -> 模型在第一次录音时才延迟加载，不是启动时加载
+
+  4. 横屏模式下如果窗口太窄，左侧内容可能需要滚动：
+     -> 已用 ScrollArea 包裹，可以滚动查看
+
+  5. 图标尚未添加：
+     -> 用户已提供图标图片路径，需要在下次打包时加入
+
+================================================================================
+十一、配置文件说明 (config.json)
+================================================================================
+
+  字段                  类型      说明
+  --------------------- --------- ----------------------------------------
+  ip                    string    OSC 服务器地址 (默认 127.0.0.1)
+  port                  int       OSC 端口 (默认 9000)
+  immediate             bool      是否立即发送 (默认 true)
+  notify                bool      是否播放提示音 (默认 false)
+  auto_send             bool     识别后是否自动发送 (默认 true)
+  voice_lang            string    语音识别语言 (zh/en/ja/ko/yue/auto)
+  mic_index             int       麦克风设备索引 (-1=默认)
+  hotkey_enabled        bool      全局热键是否启用
+  hotkey_name           string    热键按键名 (keyboard 库格式)
+  hotkey_scan_code      int       热键扫描码
+  hotkey_mode           string    热键模式 (hold/toggle)
+  layout_mode           string    布局模式 (portrait/landscape)
+  font_size             int       字体大小 (8-16)
+  vad_threshold         float     VAD 灵敏度阈值 (0.1-0.9)
+  min_silence_duration  float     静音截断时长(秒)
+  min_speech_duration   float     最短语音时长(秒)
+  max_chars             int       最大字符数 (默认144)
+
+================================================================================
+  END OF FILE
+================================================================================
