@@ -26,7 +26,8 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['torch', 'transformers', 'sentencepiece', 'scipy', 'matplotlib',
+              'pandas', 'onnx', 'sklearn', 'IPython', 'tkinter'],
     noarchive=False,
     optimize=0,
 )

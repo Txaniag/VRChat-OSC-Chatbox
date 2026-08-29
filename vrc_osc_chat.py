@@ -28,10 +28,11 @@ from PyQt5.QtWidgets import (
     QLabel, QLineEdit, QTextEdit, QPushButton, QCheckBox, QListWidget,
     QGroupBox, QStatusBar, QMessageBox, QComboBox, QRadioButton, QButtonGroup,
     QScrollArea, QFrame, QDialog, QSlider, QSpinBox, QFormLayout,
-    QDialogButtonBox, QSplitter, QGraphicsBlurEffect
+    QDialogButtonBox, QSplitter, QGraphicsBlurEffect, QGraphicsDropShadowEffect,
+    QStyledItemDelegate, QAbstractItemView
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPointF
-from PyQt5.QtGui import QIcon, QPainter, QRadialGradient, QColor, QBrush, QLinearGradient
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPointF, QPropertyAnimation, QEasingCurve, QSize, QPoint
+from PyQt5.QtGui import QIcon, QPainter, QRadialGradient, QColor, QBrush, QLinearGradient, QPixmap, QPen
 from pythonosc import udp_client
 
 # ============================================================
@@ -87,278 +88,300 @@ LANGUAGES = [
 # 原则: 毛玻璃卡片, 极光背景, Bento Grid, 胶囊按钮, 系统字体
 STYLE_SHEET = """
 QMainWindow, QWidget {
-    background-color: #f0f8f0;
-    color: #1a3a1a;
+    background-color: #eefaf7;
+    color: #0e3f3a;
     font-family: -apple-system, "SF Pro Text", "SF Pro", "PingFang SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
     font-size: 10pt;
 }
 
-/* ---- Bento Cards (淡绿毛玻璃) ---- */
+/* ---- Glass Cards (薄荷玻璃拟态) ---- */
 QGroupBox {
-    background-color: rgba(245, 255, 245, 0.88);
-    border: 1px solid rgba(52, 199, 89, 0.12);
-    border-radius: 20px;
-    margin-top: 18px;
-    padding: 16px 14px 14px 14px;
+    background-color: rgba(255, 255, 255, 0.58);
+    border: 1px solid rgba(255, 255, 255, 0.85);
+    border-radius: 22px;
+    margin-top: 20px;
+    padding: 18px 16px 14px 16px;
     font-weight: 600;
 }
 QGroupBox::title {
     subcontrol-origin: margin;
-    left: 16px;
-    padding: 0 8px;
-    color: #1a3a1a;
+    left: 18px;
+    padding: 0 10px;
+    color: #0e3f3a;
     font-size: 11pt;
     font-weight: 700;
+    letter-spacing: 0.02em;
 }
 
 /* ---- Labels ---- */
-QLabel { background: transparent; color: #1a3a1a; }
-QLabel#dimLabel { color: #6b8f6b; font-size: 9pt; }
+QLabel { background: transparent; color: #0e3f3a; }
+QLabel#dimLabel { color: #5f8a83; font-size: 9pt; }
 QLabel#titleLabel {
-    color: #1a3a1a; font-size: 17pt; font-weight: 700;
+    color: #0b332f; font-size: 18pt; font-weight: 800;
     letter-spacing: -0.02em;
 }
-QLabel#connOk { color: #2da44e; font-size: 9pt; font-weight: 500; }
-QLabel#connErr { color: #ff3b30; font-size: 9pt; font-weight: 500; }
+QLabel#connOk { color: #0ea98b; font-size: 9pt; font-weight: 600; }
+QLabel#connErr { color: #f43f5e; font-size: 9pt; font-weight: 600; }
 QLabel#partialLabel {
-    color: #6b8f6b; font-style: italic; font-size: 9pt;
+    color: #0ea98b; font-style: italic; font-size: 9pt;
     padding: 4px 0;
 }
 QLabel#offlineBadge {
-    color: #2da44e; font-size: 8pt; font-weight: 700;
-    border: 1px solid rgba(45, 164, 78, 0.3); border-radius: 8px;
-    padding: 2px 10px;
-    background: rgba(45, 164, 78, 0.08);
+    color: #0b9e82; font-size: 8pt; font-weight: 700;
+    border: 1px solid rgba(20, 184, 166, 0.35); border-radius: 18px;
+    padding: 3px 12px;
+    background: rgba(45, 212, 191, 0.12);
 }
 QLabel#listeningBadge {
-    color: #ff9500; font-size: 8pt; font-weight: 700;
-    border: 1px solid rgba(255, 149, 0, 0.3); border-radius: 8px;
-    padding: 2px 10px;
-    background: rgba(255, 149, 0, 0.08);
+    color: #e07b00; font-size: 8pt; font-weight: 700;
+    border: 1px solid rgba(255, 159, 67, 0.4); border-radius: 18px;
+    padding: 3px 12px;
+    background: rgba(255, 159, 67, 0.12);
 }
-QLabel#vadLevel { color: #2da44e; font-size: 9pt; }
+QLabel#vadLevel { color: #0ea98b; font-size: 9pt; }
 
-/* ---- Inputs (无边框, 浅绿背景) ---- */
+/* ---- Inputs ---- */
 QLineEdit, QTextEdit, QListWidget {
-    background-color: #ebf5eb;
-    color: #1a3a1a;
-    border: 1.5px solid transparent;
-    border-radius: 12px;
-    padding: 8px 12px;
-    selection-background-color: #34c759;
+    background-color: rgba(255, 255, 255, 0.55);
+    color: #0e3f3a;
+    border: 1.5px solid rgba(15, 118, 110, 0.10);
+    border-radius: 14px;
+    padding: 8px 14px;
+    selection-background-color: #2dd4bf;
     selection-color: #ffffff;
 }
 QLineEdit:focus, QTextEdit:focus, QListWidget:focus {
-    background-color: #ffffff;
-    border: 1.5px solid #34c759;
+    background-color: rgba(255, 255, 255, 0.92);
+    border: 1.5px solid #2dd4bf;
 }
 QListWidget {
-    background-color: rgba(245, 255, 245, 0.7);
-    border: 1px solid rgba(52, 199, 89, 0.08);
-    border-radius: 12px;
+    background-color: rgba(255, 255, 255, 0.42);
+    border-radius: 16px;
 }
 QListWidget::item {
-    border-radius: 8px;
-    padding: 4px 8px;
+    border-radius: 10px;
+    padding: 5px 10px;
 }
-QListWidget::item:hover { background: rgba(52, 199, 89, 0.06); }
+QListWidget::item:hover { background: rgba(45, 212, 191, 0.10); }
 QListWidget::item:selected {
-    background: rgba(52, 199, 89, 0.12);
-    color: #2da44e;
+    background: rgba(45, 212, 191, 0.18);
+    color: #0b7f68;
 }
 
-/* ---- Button Hierarchy ---- */
-/* Secondary (默认) */
+/* ---- Buttons: 全胶囊 ---- */
 QPushButton {
-    background-color: #d4e8d4;
-    color: #1a3a1a;
-    border: none;
-    border-radius: 12px;
-    padding: 7px 20px;
+    background-color: rgba(255, 255, 255, 0.65);
+    color: #0e3f3a;
+    border: 1px solid rgba(15, 118, 110, 0.14);
+    border-radius: 18px;
+    padding: 10px 22px;
     font-weight: 600;
     font-size: 10pt;
 }
-QPushButton:hover { background-color: #c0dec0; }
-QPushButton:pressed { background-color: #b0d4b0; }
+QPushButton:hover {
+    background-color: rgba(255, 255, 255, 0.9);
+    border: 1px solid rgba(45, 212, 191, 0.45);
+}
+QPushButton:pressed { background-color: rgba(45, 212, 191, 0.15); }
+QPushButton:disabled {
+    color: #9dbbb5;
+    background-color: rgba(255, 255, 255, 0.4);
+    border: 1px solid rgba(15, 118, 110, 0.06);
+}
 
-/* Primary (发送) */
+/* Primary (发送) - 薄荷渐变 */
 QPushButton#sendBtn {
-    background-color: #2da44e;
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #43e0b0, stop:1 #21c9a8);
     color: #ffffff;
     border: none;
-    border-radius: 12px;
-    padding: 10px 28px;
+    border-radius: 18px;
+    padding: 12px 32px;
     font-size: 11pt;
-    font-weight: 600;
+    font-weight: 700;
 }
-QPushButton#sendBtn:hover { background-color: #2cb359; }
-QPushButton#sendBtn:pressed { background-color: #269a45; }
+QPushButton#sendBtn:hover {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #52e8bc, stop:1 #2bd6b3);
+}
+QPushButton#sendBtn:pressed {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #2fcfa2, stop:1 #17b795);
+}
 QPushButton#sendBtn:disabled {
-    background-color: #c0d4c0;
-    color: #8fb58f;
+    background-color: rgba(15, 118, 110, 0.15);
+    color: #9dbbb5;
 }
 
 /* Mic PTT */
 QPushButton#micBtn {
-    background-color: rgba(45, 164, 78, 0.12);
-    color: #1a7a37;
-    border: 1.5px solid rgba(45, 164, 78, 0.3);
-    border-radius: 12px;
-    padding: 8px 20px;
+    background-color: rgba(45, 212, 191, 0.14);
+    color: #0b7f68;
+    border: 1.5px solid rgba(45, 212, 191, 0.4);
+    border-radius: 18px;
+    padding: 11px 24px;
     font-size: 10pt;
     font-weight: 600;
 }
 QPushButton#micBtn:hover {
-    background-color: rgba(45, 164, 78, 0.2);
-    border: 1.5px solid rgba(45, 164, 78, 0.5);
+    background-color: rgba(45, 212, 191, 0.24);
+    border: 1.5px solid rgba(45, 212, 191, 0.6);
 }
-QPushButton#micBtn:pressed { background-color: rgba(45, 164, 78, 0.08); }
+QPushButton#micBtn:pressed { background-color: rgba(45, 212, 191, 0.32); }
 QPushButton#micBtn:disabled {
-    color: #b0c8b0;
-    border: 1.5px solid rgba(0, 0, 0, 0.06);
-    background: rgba(0, 0, 0, 0.03);
+    color: #9dbbb5;
+    border: 1.5px solid rgba(15, 118, 110, 0.08);
+    background: rgba(255, 255, 255, 0.35);
 }
 
 /* Recording */
 QPushButton#micRecording {
-    background-color: #ff3b30;
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #ff6b8b, stop:1 #f43f5e);
     color: #ffffff;
     border: none;
-    border-radius: 12px;
-    padding: 8px 20px;
+    border-radius: 18px;
+    padding: 11px 24px;
     font-size: 10pt;
-    font-weight: 600;
+    font-weight: 700;
 }
-QPushButton#micRecording:hover { background-color: #ff453a; }
-QPushButton#micRecording:pressed { background-color: #d70015; }
+QPushButton#micRecording:hover { background-color: #ff5470; }
+QPushButton#micRecording:pressed { background-color: #e11d48; }
 
 /* Continuous */
 QPushButton#micContinuous {
-    background-color: rgba(255, 149, 0, 0.12);
-    color: #c93400;
-    border: 1.5px solid rgba(255, 149, 0, 0.3);
-    border-radius: 12px;
-    padding: 8px 20px;
+    background-color: rgba(255, 159, 67, 0.12);
+    color: #d97706;
+    border: 1.5px solid rgba(255, 159, 67, 0.35);
+    border-radius: 18px;
+    padding: 11px 24px;
     font-size: 10pt;
     font-weight: 600;
 }
 QPushButton#micContinuous:hover {
-    background-color: rgba(255, 149, 0, 0.2);
-    border: 1.5px solid rgba(255, 149, 0, 0.5);
+    background-color: rgba(255, 159, 67, 0.2);
+    border: 1.5px solid rgba(255, 159, 67, 0.55);
 }
-QPushButton#micContinuous:pressed { background-color: rgba(255, 149, 0, 0.08); }
+QPushButton#micContinuous:pressed { background-color: rgba(255, 159, 67, 0.28); }
 
 QPushButton#micContinuousActive {
-    background-color: #ff9500;
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #ffb347, stop:1 #ff9f43);
     color: #ffffff;
     border: none;
-    border-radius: 12px;
-    padding: 8px 20px;
+    border-radius: 18px;
+    padding: 11px 24px;
     font-size: 10pt;
-    font-weight: 600;
+    font-weight: 700;
 }
-QPushButton#micContinuousActive:hover { background-color: #ffa00a; }
-QPushButton#micContinuousActive:pressed { background-color: #e68600; }
+QPushButton#micContinuousActive:hover { background-color: #ffab2e; }
+QPushButton#micContinuousActive:pressed { background-color: #f08c00; }
 
 /* ComboBox */
 QComboBox {
-    background-color: #ebf5eb;
-    color: #1a3a1a;
-    border: 1.5px solid transparent;
-    border-radius: 10px;
-    padding: 5px 10px;
+    background-color: rgba(255, 255, 255, 0.55);
+    color: #0e3f3a;
+    border: 1.5px solid rgba(15, 118, 110, 0.10);
+    border-radius: 18px;
+    padding: 5px 14px;
     min-width: 70px;
 }
-QComboBox:hover { background-color: #dcecdc; }
-QComboBox:focus { background-color: #ffffff; border: 1.5px solid #34c759; }
-QComboBox::drop-down { border: none; width: 22px; }
+QComboBox:hover { background-color: rgba(255, 255, 255, 0.85); }
+QComboBox:focus { border: 1.5px solid #2dd4bf; }
+QComboBox::drop-down { border: none; width: 24px; background: transparent; }
 QComboBox::down-arrow {
-    width: 0; height: 0;
-    border-left: 5px solid transparent;
-    border-right: 5px solid transparent;
-    border-top: 6px solid #6b8f6b;
-    margin-right: 8px;
+    image: url(@ARROW@);
+    width: 12px; height: 8px;
+    margin-right: 10px;
 }
 QComboBox QAbstractItemView {
-    background-color: rgba(245, 255, 245, 0.95);
-    color: #1a3a1a;
-    selection-background-color: #2da44e;
+    background-color: rgba(255, 255, 255, 0.98);
+    color: #0e3f3a;
+    selection-background-color: #2dd4bf;
     selection-color: #ffffff;
-    border: 1px solid rgba(52, 199, 89, 0.12);
-    border-radius: 12px;
+    border: 1.5px solid rgba(45, 212, 191, 0.40);
+    border-radius: 14px;
     outline: none;
-    padding: 4px;
+    padding: 6px;
 }
 QComboBox QAbstractItemView::item {
-    border-radius: 6px;
-    padding: 4px 8px;
+    border-radius: 8px;
+    padding: 5px 10px;
+    margin: 1px 2px;
+    min-height: 20px;
+    background: transparent;
 }
+QComboBox QAbstractItemView::item:hover { background: rgba(45, 212, 191, 0.15); }
+QComboBox QAbstractItemView::item:selected { background: #2dd4bf; color: #ffffff; }
 
 /* Checkbox */
-QCheckBox { background: transparent; spacing: 8px; color: #1a3a1a; }
+QCheckBox { background: transparent; spacing: 8px; color: #0e3f3a; }
 QCheckBox::indicator {
     width: 18px; height: 18px;
-    border-radius: 5px;
-    border: 1.5px solid #b0c8b0;
-    background: #ebf5eb;
+    border-radius: 6px;
+    border: 1.5px solid rgba(15, 118, 110, 0.25);
+    background: rgba(255, 255, 255, 0.6);
 }
-QCheckBox::indicator:hover { border: 1.5px solid #6b8f6b; }
+QCheckBox::indicator:hover { border: 1.5px solid #2dd4bf; }
 QCheckBox::indicator:checked {
-    background: #2da44e;
-    border: 1.5px solid #2da44e;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #43e0b0, stop:1 #21c9a8);
+    border: 1.5px solid transparent;
 }
 
 /* Radio */
-QRadioButton { background: transparent; spacing: 8px; color: #1a3a1a; }
+QRadioButton { background: transparent; spacing: 8px; color: #0e3f3a; }
 QRadioButton::indicator {
     width: 16px; height: 16px;
     border-radius: 8px;
-    border: 1.5px solid #b0c8b0;
-    background: #ebf5eb;
+    border: 1.5px solid rgba(15, 118, 110, 0.25);
+    background: rgba(255, 255, 255, 0.6);
 }
+QRadioButton::indicator:hover { border: 1.5px solid #2dd4bf; }
 QRadioButton::indicator:checked {
-    background: #2da44e;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #43e0b0, stop:1 #21c9a8);
     border: 2px solid #ffffff;
 }
 
 /* Hotkey btn */
 QPushButton#hotkeyBtn {
-    background-color: #ebf5eb;
-    color: #2da44e;
-    border: 1.5px dashed rgba(45, 164, 78, 0.3);
-    border-radius: 10px;
-    padding: 4px 12px;
+    background-color: rgba(45, 212, 191, 0.10);
+    color: #0b7f68;
+    border: 1.5px dashed rgba(45, 212, 191, 0.45);
+    border-radius: 18px;
+    padding: 11px 14px;
     font-weight: 600;
     min-width: 70px;
 }
 QPushButton#hotkeyBtn:hover {
-    border: 1.5px dashed rgba(45, 164, 78, 0.6);
-    background-color: rgba(45, 164, 78, 0.05);
+    border: 1.5px dashed rgba(45, 212, 191, 0.8);
+    background-color: rgba(45, 212, 191, 0.16);
 }
 QPushButton#hotkeyBtn:pressed {
-    background-color: rgba(45, 164, 78, 0.1);
+    background-color: rgba(45, 212, 191, 0.24);
 }
 
 /* Settings btn */
 QPushButton#settingsBtn {
-    background-color: rgba(245, 255, 245, 0.7);
-    color: #2da44e;
-    border: 1px solid rgba(52, 199, 89, 0.1);
-    border-radius: 12px;
-    padding: 5px 16px;
+    background-color: rgba(255, 255, 255, 0.55);
+    color: #0b7f68;
+    border: 1px solid rgba(45, 212, 191, 0.25);
+    border-radius: 18px;
+    padding: 11px 18px;
     font-weight: 600;
 }
 QPushButton#settingsBtn:hover {
-    background-color: rgba(45, 164, 78, 0.06);
-    border: 1px solid rgba(45, 164, 78, 0.2);
+    background-color: rgba(255, 255, 255, 0.9);
+    border: 1px solid rgba(45, 212, 191, 0.5);
 }
-QPushButton#settingsBtn:pressed { background-color: rgba(45, 164, 78, 0.1); }
+QPushButton#settingsBtn:pressed { background-color: rgba(45, 212, 191, 0.16); }
 
-/* Status bar */
+/* Status bar - 悬浮玻璃条 */
 QStatusBar {
-    background-color: rgba(245, 255, 245, 0.7);
-    color: #6b8f6b;
-    border-top: 1px solid rgba(52, 199, 89, 0.08);
+    background-color: rgba(255, 255, 255, 0.35);
+    color: #5f8a83;
+    border-top: 1px solid rgba(255, 255, 255, 0.5);
     font-size: 9pt;
 }
 
@@ -371,47 +394,72 @@ QScrollBar:vertical {
     margin: 4px;
 }
 QScrollBar::handle:vertical {
-    background: rgba(52, 199, 89, 0.2);
+    background: rgba(45, 212, 191, 0.28);
     border-radius: 4px;
     min-height: 30px;
 }
-QScrollBar::handle:vertical:hover { background: rgba(52, 199, 89, 0.35); }
+QScrollBar::handle:vertical:hover { background: rgba(45, 212, 191, 0.5); }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar:horizontal { height: 0; }
 
 /* Slider */
 QSlider::groove:horizontal {
-    background: #d4e8d4;
+    background: rgba(15, 118, 110, 0.12);
     height: 6px;
     border-radius: 3px;
 }
 QSlider::sub-page:horizontal {
-    background: #2da44e;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #43e0b0, stop:1 #21c9a8);
     border-radius: 3px;
 }
 QSlider::handle:horizontal {
     background: #ffffff;
     width: 18px; height: 18px;
     border-radius: 9px;
-    border: 1px solid rgba(52, 199, 89, 0.15);
+    border: 1px solid rgba(45, 212, 191, 0.35);
     margin: -6px 0;
 }
 QSlider::handle:horizontal:hover {
-    border: 2px solid #2da44e;
+    border: 2px solid #21c9a8;
 }
 
 /* SpinBox */
 QSpinBox {
-    background-color: #ebf5eb;
-    color: #1a3a1a;
-    border: 1.5px solid transparent;
-    border-radius: 8px;
-    padding: 3px 6px;
+    background-color: rgba(255, 255, 255, 0.55);
+    color: #0e3f3a;
+    border: 1.5px solid rgba(15, 118, 110, 0.10);
+    border-radius: 10px;
+    padding: 3px 8px;
 }
-QSpinBox:focus { background-color: #ffffff; border: 1.5px solid #34c759; }
+QSpinBox:focus { background-color: rgba(255, 255, 255, 0.92); border: 1.5px solid #2dd4bf; }
 
 /* Dialog */
-QDialog { background-color: #f0f8f0; }
+QDialog { background-color: #eefaf7; }
+"""
+
+# 下拉弹层视图专用样式：直接挂在 view 上（自身样式表优先级最高、应用可靠；
+# 全局 QSS 对 QComboBox 弹层视图在主窗口环境中应用不稳定，会导致原生回退）
+POPUP_VIEW_QSS = """
+QListView {
+    background-color: #ffffff;
+    color: #0e3f3a;
+    border: 1.5px solid rgba(45, 212, 191, 0.40);
+    border-radius: 14px;
+    outline: none;
+    padding: 6px;
+    selection-background-color: #2dd4bf;
+    selection-color: #ffffff;
+}
+QListView::item {
+    border-radius: 8px;
+    padding: 5px 10px;
+    margin: 1px 2px;
+    min-height: 20px;
+    background: transparent;
+}
+QListView::item:hover { background: rgba(45, 212, 191, 0.15); }
+QListView::item:selected { background: #2dd4bf; color: #ffffff; }
 """
 
 
@@ -419,7 +467,7 @@ QDialog { background-color: #f0f8f0; }
 # 淡绿色极光背景 - 直接在主窗口 paintEvent 绘制
 # ============================================================
 def paint_aurora_background(widget, event):
-    """在主窗口背景上绘制淡绿色弥散光球。"""
+    """在主窗口背景上绘制薄荷玻璃风弥散光球。"""
     painter = QPainter(widget)
     painter.setRenderHint(QPainter.Antialiasing)
 
@@ -427,32 +475,34 @@ def paint_aurora_background(widget, event):
     if w == 0 or h == 0:
         return
 
-    # 底色: 淡绿白
-    painter.fillRect(event.rect(), QColor(240, 248, 240))
+    # 底色: 薄荷白
+    painter.fillRect(event.rect(), QColor(238, 250, 247))
 
-    # 光球 1: 淡绿 - 左上
-    c1 = QRadialGradient(w * 0.15, h * 0.15, max(w, h) * 0.5)
-    c1.setColorAt(0, QColor(120, 200, 130, 80))
-    c1.setColorAt(0.5, QColor(120, 200, 130, 30))
-    c1.setColorAt(1, QColor(120, 200, 130, 0))
-    painter.setBrush(QBrush(c1))
-    painter.setPen(Qt.NoPen)
-    painter.drawEllipse(QPointF(w * 0.15, h * 0.15), w * 0.55, h * 0.55)
+    def orb(cx, cy, rx, ry, color_inner, color_mid):
+        """绘制一枚弥散光球。"""
+        g = QRadialGradient(cx, cy, max(rx, ry))
+        g.setColorAt(0, color_inner)
+        g.setColorAt(0.5, color_mid)
+        g.setColorAt(1, QColor(color_mid.red(), color_mid.green(), color_mid.blue(), 0))
+        painter.setBrush(QBrush(g))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(QPointF(cx, cy), rx, ry)
 
-    # 光球 2: 淡青绿 - 右下
-    c2 = QRadialGradient(w * 0.85, h * 0.8, max(w, h) * 0.5)
-    c2.setColorAt(0, QColor(100, 220, 180, 60))
-    c2.setColorAt(0.5, QColor(100, 220, 180, 20))
-    c2.setColorAt(1, QColor(100, 220, 180, 0))
-    painter.setBrush(QBrush(c2))
-    painter.drawEllipse(QPointF(w * 0.85, h * 0.8), w * 0.5, h * 0.5)
-
-    # 光球 3: 淡黄绿 - 中上
-    c3 = QRadialGradient(w * 0.6, h * 0.3, max(w, h) * 0.35)
-    c3.setColorAt(0, QColor(180, 220, 100, 40))
-    c3.setColorAt(1, QColor(180, 220, 100, 0))
-    painter.setBrush(QBrush(c3))
-    painter.drawEllipse(QPointF(w * 0.6, h * 0.3), w * 0.35, h * 0.35)
+    # 光球 1: 薄荷绿 - 左上
+    orb(w * 0.12, h * 0.10, w * 0.55, h * 0.55,
+        QColor(64, 224, 180, 90), QColor(64, 224, 180, 30))
+    # 光球 2: 青碧 - 右下
+    orb(w * 0.88, h * 0.85, w * 0.50, h * 0.50,
+        QColor(45, 200, 220, 70), QColor(45, 200, 220, 22))
+    # 光球 3: 樱粉 - 右上 (二次元点缀)
+    orb(w * 0.85, h * 0.12, w * 0.38, h * 0.38,
+        QColor(255, 170, 200, 55), QColor(255, 170, 200, 18))
+    # 光球 4: 淡青 - 中部
+    orb(w * 0.45, h * 0.55, w * 0.35, h * 0.35,
+        QColor(120, 230, 210, 40), QColor(120, 230, 210, 12))
+    # 光球 5: 淡黄绿 - 左下
+    orb(w * 0.15, h * 0.88, w * 0.30, h * 0.30,
+        QColor(190, 235, 130, 45), QColor(190, 235, 130, 14))
 
 
 class OSCSender:
@@ -764,7 +814,7 @@ class SettingsDialog(QDialog):
             "百度 API 免费注册: fanyi-api.baidu.com"
         )
         hint_label.setWordWrap(True)
-        hint_label.setStyleSheet("color: #86868b; font-size: 9pt;")
+        hint_label.setStyleSheet("color: #5f8a83; font-size: 9pt;")
         trans_form.addRow("", hint_label)
         layout.addWidget(trans_group)
 
@@ -1365,6 +1415,9 @@ class MainWindow(QMainWindow):
         hist_layout.addLayout(hist_btn_row)
         self.history_list = QListWidget()
         self.history_list.setMinimumHeight(60)
+        self.history_list.setWordWrap(True)
+        self.history_list.setTextElideMode(Qt.ElideNone)
+        self.history_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.history_list.itemDoubleClicked.connect(self._on_history_double_click)
         hist_layout.addWidget(self.history_list)
 
@@ -1393,6 +1446,87 @@ class MainWindow(QMainWindow):
             self._build_landscape()
         else:
             self._build_portrait()
+        self._apply_glass_shadows()
+        self._polish_combo_popups()
+
+    def _polish_combo_popups(self):
+        """下拉弹层：视图挂自身 QSS（mint 选中/圆角），容器四角真正透明。
+        不能用不透明无边框窗口——四角会露出窗口原始黑色表面产生黑角；
+        用 WA_TranslucentBackground 让四角透明，配合 DWM 关闭淡入过渡避免打开闪黑。
+        注意：不能对弹层容器 setStyleSheet，否则主窗口里弹层视图会丢掉全局 QSS 变成原生样式。"""
+        for combo in self.findChildren(QComboBox):
+            view = combo.view()
+            if view is None:
+                continue
+            container = view.window()
+            if container is None:
+                continue
+            try:
+                # 弹层视图挂自身样式表：选中/圆角样式稳定生效（不依赖全局 QSS）
+                view.setStyleSheet(POPUP_VIEW_QSS)
+                # 隐藏弹层滚动条（滚轮仍可滚动），避免突兀
+                view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                # 容器四角透明：圆角由视图自身 QSS 绘制，四角露出下方内容而非黑色
+                container.setAttribute(Qt.WA_TranslucentBackground)
+                container.setWindowFlags(
+                    Qt.Popup | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint
+                )
+                self._disable_native_frame_rendering(container)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _disable_native_frame_rendering(container):
+        """禁用 DWM 对弹窗的原生边框/描边渲染，并关闭淡入过渡，避免打开瞬间闪黑。"""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            hwnd = int(container.winId())
+            dwm = ctypes.windll.dwmapi
+            val = ctypes.c_int(1)  # DWMNCRP_DISABLED
+            dwm.DwmSetWindowAttribute(
+                hwnd, 2, ctypes.byref(val), ctypes.sizeof(val)  # DWMWA_NCRENDERING_POLICY
+            )
+            none_color = ctypes.c_uint(0xFFFFFFFE)  # DWMWA_COLOR_NONE
+            dwm.DwmSetWindowAttribute(
+                hwnd, 34, ctypes.byref(none_color), ctypes.sizeof(none_color)  # DWMWA_BORDER_COLOR
+            )
+            # 关闭窗体出现/消失的过渡动画：半透明弹窗淡入时会被合成出黑底
+            trans = ctypes.c_int(1)  # DWMTRANSITION_FORCEDISABLED
+            dwm.DwmSetWindowAttribute(
+                hwnd, 3, ctypes.byref(trans), ctypes.sizeof(trans)  # DWMWA_TRANSITIONS_FORCEDISABLED
+            )
+        except Exception:
+            pass
+
+    def _apply_glass_shadows(self):
+        """给玻璃卡片加悬浮阴影 + hover 浮起动效。"""
+        for group in self.findChildren(QGroupBox):
+            effect = group.graphicsEffect()
+            if not isinstance(effect, QGraphicsDropShadowEffect):
+                effect = QGraphicsDropShadowEffect(self)
+                effect.setBlurRadius(16)
+                effect.setOffset(0, 5)
+                effect.setColor(QColor(15, 118, 110, 38))
+                group.setGraphicsEffect(effect)
+                group.installEventFilter(self)
+
+    def _animate_card_lift(self, obj, enter):
+        """hover 时阴影扩散产生浮起感。"""
+        effect = obj.graphicsEffect()
+        if not isinstance(effect, QGraphicsDropShadowEffect):
+            return
+        for prop, target in (
+            ("blurRadius", 28 if enter else 16),
+            ("yOffset", 10 if enter else 5),
+        ):
+            anim = QPropertyAnimation(effect, prop.encode("ascii"), obj)
+            anim.setDuration(180)
+            anim.setEndValue(target)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            anim.start(QPropertyAnimation.DeleteWhenStopped)
 
     def _build_portrait(self):
         """竖屏：Bento Grid 单列。"""
@@ -1459,6 +1593,9 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 3)  # 左 3
         splitter.setStretchFactor(1, 1)  # 右 1
         splitter.setSizes([860, 300])
+        splitter.splitterMoved.connect(
+            lambda *_: self._relayout_history()
+        )
 
         self.setCentralWidget(splitter)
         self._main_container = splitter
@@ -1493,6 +1630,10 @@ class MainWindow(QMainWindow):
                event.modifiers() & Qt.ControlModifier:
                 self._send()
                 return True
+        # 玻璃卡片 hover 浮起
+        if event.type() in (event.Enter, event.Leave) and \
+                isinstance(obj, QGroupBox) and obj.graphicsEffect():
+            self._animate_card_lift(obj, event.type() == event.Enter)
         return super().eventFilter(obj, event)
 
     def paintEvent(self, event):
@@ -1501,9 +1642,11 @@ class MainWindow(QMainWindow):
         super().paintEvent(event)
 
     def resizeEvent(self, event):
-        """窗口大小变化时重绘背景。"""
+        """窗口大小变化时重绘背景并重排历史列表行高。"""
         super().resizeEvent(event)
         self.update()
+        if getattr(self, "history_list", None) is not None:
+            self._relayout_history()
 
     # ----------------------------------------------------------
     # 设置对话框
@@ -2023,11 +2166,32 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------
     # 历史
     # ----------------------------------------------------------
+    def _relayout_history(self):
+        """按当前列表宽度重算每条历史的高度，放不下自动折行。"""
+        if self.history_list is None:
+            return
+        w = self.history_list.viewport().width() - 22  # 扣除条目内边距
+        if w < 100:
+            w = 100
+        fm = self.history_list.fontMetrics()
+        for i in range(self.history_list.count()):
+            item = self.history_list.item(i)
+            rect = fm.boundingRect(0, 0, w, 100000, Qt.TextWordWrap, item.text())
+            item.setSizeHint(QSize(w + 22, rect.height() + 12))
+
     def _add_history(self, entry):
         self._history.insert(0, entry)
         if len(self._history) > MAX_HISTORY:
             self._history = self._history[:MAX_HISTORY]
-        self.history_list.insertItem(0, entry)
+        item = QListWidgetItem(entry)
+        self.history_list.insertItem(0, item)
+        w = self.history_list.viewport().width() - 22  # 扣除条目内边距
+        if w < 100:
+            w = 100
+        rect = self.history_list.fontMetrics().boundingRect(
+            0, 0, w, 100000, Qt.TextWordWrap, entry
+        )
+        item.setSizeHint(QSize(w + 22, rect.height() + 12))
         self._save_history()
 
     def _on_history_double_click(self, item):
@@ -2054,6 +2218,9 @@ class MainWindow(QMainWindow):
                     self._history = json.load(f)
                 for item in self._history:
                     self.history_list.addItem(item)
+                # 等布局就绪后再算行高（否则宽度未定会截断）
+                QTimer.singleShot(0, self._relayout_history)
+                QTimer.singleShot(200, self._relayout_history)
         except Exception:
             self._history = []
 
@@ -2172,8 +2339,56 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+def _make_combo_arrow_icon():
+    """生成下拉框的小箭头 PNG（chevron），返回可供 QSS url() 使用的路径。"""
+    try:
+        import tempfile
+        d = os.path.join(tempfile.gettempdir(), "vrc_osc_assets")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "combo_arrow.png")
+        pm = QPixmap(12, 8)
+        pm.fill(Qt.transparent)
+        painter = QPainter(pm)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setPen(QPen(QColor("#4f7d76"), 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawPolyline([QPoint(2, 2), QPoint(6, 6), QPoint(10, 2)])
+        finally:
+            painter.end()
+        if not pm.save(path, "PNG"):
+            return ""
+        return path.replace("\\", "/")
+    except Exception:
+        return ""
+
+
 def main():
+    # Windows 任务栏自定义图标：显式 AppUserModelID，避免归属 python.exe 显示默认图标
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "Txaniag.VRChatOSCChatbox.1"
+            )
+        except Exception:
+            pass
+    # 注意: 必须先创建 QApplication 再设置图标，否则进程会静默退出
     app = QApplication(sys.argv)
+    # 关闭弹层打开动画：Windows 对半透明弹窗做原生淡入时会短暂闪黑边，改为瞬间显示
+    try:
+        app.setEffectEnabled(Qt.UI_AnimateMenu, False)
+    except Exception:
+        pass
+    icon_file = os.path.join(APP_DIR, "app_icon.ico")
+    if not os.path.exists(icon_file):
+        icon_file = os.path.join(RES_DIR, "app_icon.ico")
+    if os.path.exists(icon_file):
+        app.setWindowIcon(QIcon(icon_file))
+    # 生成下拉箭头图标并替换 QSS 中的 @ARROW@ 占位符（QPixmap 依赖 QApplication，必须在 app 之后）
+    global STYLE_SHEET
+    arrow_path = _make_combo_arrow_icon()
+    if arrow_path:
+        STYLE_SHEET = STYLE_SHEET.replace("@ARROW@", arrow_path)
     app.setStyleSheet(STYLE_SHEET)
     window = MainWindow()
     window.show()
