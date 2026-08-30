@@ -77,7 +77,7 @@ VAD_MODEL = os.path.join(MODEL_DIR, "silero_vad.onnx")
 # 常量
 # ============================================================
 APP_TITLE = "VRChat OSC Chatbox Sender"
-APP_VERSION = "4.2.0"
+APP_VERSION = "4.3.0"
 DEFAULT_IP = "127.0.0.1"
 DEFAULT_PORT = 9000
 MAX_CHARS = 144
@@ -1252,7 +1252,7 @@ class SpeakerEngine(QObject):
             stream.accept_waveform(SAMPLE_RATE, samples)
             self._recognizer.decode_stream(stream)
             text = stream.result.text.strip()
-            if not _has_real_text(text):
+            if not _is_real_speech(text):
                 self.status.emit("（这段没识别到清晰语音）")
                 return
             self.partialResult.emit(text)
@@ -1700,6 +1700,26 @@ def _has_real_text(text):
     if not text:
         return False
     return bool(re.sub(r"[\W_]+", "", text, flags=re.UNICODE))
+
+
+# 纯语气词（嗯/呃/啊之类）——背景噪声被误切成段时常识别出这些，没有传达内容
+_CJK_FILLER_RE = re.compile(r"[嗯呃啊哦噢喔唔诶欸唉哎呀嘛嘿哈哟呦]+")
+_EN_FILLER_RE = re.compile(r"\b(?:um+|uh+|hmm+|ah+|oh+|erm+|huh+)\b", re.IGNORECASE)
+_PUNCT_GAP_RE = re.compile(r"[，。,.!！?？、；;：:~\-—…\s]+")
+
+
+def _is_real_speech(text):
+    """剔除标点和语气词后是否还有实际内容。
+
+    "嗯。"、"呃。。"、"哈哈"这类纯语气结果按未识别丢弃；
+    "嗯，我们今天来聊聊"这类语气词开头带实际内容的正常保留。
+    """
+    if not _has_real_text(text):
+        return False
+    residue = _CJK_FILLER_RE.sub("", text)
+    residue = _PUNCT_GAP_RE.sub(" ", residue)
+    residue = _EN_FILLER_RE.sub("", residue)
+    return _has_real_text(residue)
 
 
 def voice_lang_to_baidu(lang_code):
@@ -2369,7 +2389,7 @@ class VoiceEngine(QObject):
             self._recognizer.decode_stream(stream)
             text = stream.result.text.strip()
 
-            if _has_real_text(text):
+            if _is_real_speech(text):
                 self.finalResult.emit(text)
                 self.status.emit(f"识别完成: {text}")
             else:
@@ -2446,7 +2466,7 @@ class VoiceEngine(QObject):
                 stream.accept_waveform(SAMPLE_RATE, samples)
                 self._recognizer.decode_stream(stream)
                 text = stream.result.text.strip()
-                if _has_real_text(text):
+                if _is_real_speech(text):
                     self.finalResult.emit(text)
                     self.status.emit(f"识别: {text}")
             except Exception as e:
