@@ -77,7 +77,7 @@ VAD_MODEL = os.path.join(MODEL_DIR, "silero_vad.onnx")
 # 常量
 # ============================================================
 APP_TITLE = "VRChat OSC Chatbox Sender"
-APP_VERSION = "4.3.0"
+APP_VERSION = "4.3.1"
 DEFAULT_IP = "127.0.0.1"
 DEFAULT_PORT = 9000
 MAX_CHARS = 144
@@ -1203,6 +1203,7 @@ class SpeakerEngine(QObject):
         self._recognizer = None
         self._segmenter = None
         self._running = False
+        self._loaded_lang = None  # 识别器当前加载的语言
         self._gen = 0  # 代际计数：热切换输出设备时作废旧工作线程
         self._device_index = None
         self._lang = "auto"
@@ -1234,7 +1235,8 @@ class SpeakerEngine(QObject):
         self._tr_running = False
 
     def _ensure_models(self):
-        if self._recognizer is not None:
+        # 语言变更时重建识别器，让"源语言"切换立即生效（否则模型只在首次加载用旧语言）
+        if self._recognizer is not None and self._loaded_lang == self._lang:
             return
         if not os.path.exists(ASR_MODEL):
             raise FileNotFoundError(f"找不到语音识别模型: {ASR_MODEL}")
@@ -1246,6 +1248,7 @@ class SpeakerEngine(QObject):
             use_itn=True,
             language=self._lang,
         )
+        self._loaded_lang = self._lang
         # sherpa 1.13.x Silero VAD 出段损坏，改用能量分段器（参数对扬声器更严格）
         self._segmenter = _EnergySegmenter(
             sr=SAMPLE_RATE, gain=1.4, min_speech=0.3, min_silence=0.7, max_speech=10.0
@@ -1286,6 +1289,9 @@ class SpeakerEngine(QObject):
                 )
                 try:
                     while self._running and self._gen == my_gen:
+                        if self._lang != self._loaded_lang:
+                            self._recognizer = None  # 语言切换 → 重建识别器
+                            self._ensure_models()
                         data = stream.read(int(rate * 0.1), exception_on_overflow=False)
                         x = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
                         if ch > 1:
@@ -2323,6 +2329,7 @@ class VoiceEngine(QObject):
         super().__init__()
         self._recognizer = None
         self._segmenter = None
+        self._loaded_language = None  # 识别器当前加载的语言
         self._pa = None
         self._stream = None
         self._running = False
@@ -2342,6 +2349,10 @@ class VoiceEngine(QObject):
         # 连续模式状态
         self._in_speech = False
 
+    def set_language(self, language):
+        """更新识别语言（连续监听运行中也会在下一个音频块生效）。"""
+        self._language = language or "zh"
+
     def set_vad_params(self, threshold=None, min_silence=None, min_speech=None, max_speech=None):
         """更新 VAD 参数（下次初始化模型时生效）。"""
         if threshold is not None:
@@ -2354,7 +2365,8 @@ class VoiceEngine(QObject):
             self._max_speech_duration = max_speech
 
     def _init_models(self):
-        if self._recognizer is not None:
+        # 语言变更时重建识别器，让语言切换立即生效
+        if self._recognizer is not None and self._loaded_language == self._language:
             return
         if not os.path.exists(ASR_MODEL):
             raise FileNotFoundError(f"找不到语音识别模型: {ASR_MODEL}")
@@ -2367,6 +2379,7 @@ class VoiceEngine(QObject):
             use_itn=True,
             language=self._language,
         )
+        self._loaded_language = self._language
         # sherpa 1.13.x 的 Silero VAD 在部分环境出段损坏（只出 0 采样空段），
         # 连续监听改用能量分段器，设置里的参数映射过去
         self._segmenter = _EnergySegmenter(
@@ -2518,6 +2531,10 @@ class VoiceEngine(QObject):
                     data = self._audio_queue.get(timeout=0.5)
                 except queue.Empty:
                     continue
+
+                if self._language != self._loaded_language:
+                    self._recognizer = None  # 语言切换 → 重建识别器
+                    self._init_models()
 
                 samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
                 self._segmenter.accept(samples)
@@ -2795,6 +2812,10 @@ class MainWindow(QMainWindow):
         for label, code in LANGUAGES:
             self.lang_combo.addItem(label, code)
         self.lang_combo.setCurrentIndex(1)  # 默认中文
+        # 连续监听运行中切换语言 → 识别器即时重建，无需重启监听
+        self.lang_combo.currentIndexChanged.connect(
+            lambda: (self.voice.set_language(self.lang_combo.currentData() or "zh"),
+                     self._save_config()))
         settings_row.addWidget(self.lang_combo)
         voice_layout.addLayout(settings_row)
 
