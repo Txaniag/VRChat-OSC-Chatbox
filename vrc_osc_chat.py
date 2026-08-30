@@ -3154,33 +3154,12 @@ class MainWindow(QMainWindow):
         """卡片级联入场：淡入 + 14px 上浮归位（50ms 间隔重叠展开）。"""
         widgets = self._entrance_widgets()
         step = int(50 * MOTION_SCALE)
-        dur = int(280 * MOTION_SCALE)
         for i, w in enumerate(widgets):
             try:
                 fade_in(w, duration=280, delay=i * step)
             except RuntimeError:
                 continue
-            if not MOTION_OK:
-                continue
 
-            def _rise(w=w, delay=i * step, dur=dur):
-                try:
-                    geo = w.geometry()
-                    if geo.height() <= 0:
-                        return
-                    w.setGeometry(geo.x(), geo.y() + 14, geo.width(), geo.height())
-                    anim = QPropertyAnimation(w, b"geometry", w)
-                    anim.setDuration(dur)
-                    anim.setStartValue(w.geometry())
-                    anim.setEndValue(geo)
-                    anim.setEasingCurve(_out_cubic())
-                    anim.start()
-                    w._card_rise = anim
-                except RuntimeError:
-                    pass
-
-            # 延迟到期才位移（淡入未开始时卡片不可见，位移不会被看到）
-            QTimer.singleShot(delay, _rise)
         total = int((step * len(widgets) + 320 + 120) * MOTION_SCALE)
         # 入场用的透明度特效会顶掉阴影特效，入场结束后统一补挂玻璃阴影
         QTimer.singleShot(total, self._apply_glass_shadows)
