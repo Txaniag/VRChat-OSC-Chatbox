@@ -553,29 +553,31 @@ QTextEdit#floatBody {
     selection-color: #ffffff;
 }
 
-/* ---- 自绘标题栏 (无边框窗口) ---- */
+/* ---- 标题栏 macOS 红绿灯按钮：常显彩色圆点，悬停时符号淡入 ---- */
 QLabel#winTitle {
     color: #527052;
     font-size: 9pt;
     font-weight: 600;
     letter-spacing: 0.01em;
 }
-QPushButton#winBtn {
-    background: transparent;
-    border: none;
+QPushButton#tlMin, QPushButton#tlMax, QPushButton#tlClose {
+    background-color: #cfd8cf;
+    border: 1px solid rgba(0, 0, 0, 0.08);
     border-radius: 8px;
-    color: #527052;
+    color: transparent;
     font-family: "Segoe UI Symbol";
-    font-size: 10pt;
+    font-size: 7pt;
     padding: 0;
 }
-QPushButton#winBtn:hover { background-color: rgba(0, 0, 0, 0.07); }
-QPushButton#winBtn:pressed { background-color: rgba(0, 0, 0, 0.13); }
-QPushButton#winBtn#closeBtn:hover {
-    background-color: #ff5f57;
-    color: #ffffff;
-}
-QPushButton#winBtn#closeBtn:pressed { background-color: #e0443e; }
+QPushButton#tlMin { background-color: #febc2e; }
+QPushButton#tlMax { background-color: #28c840; }
+QPushButton#tlClose { background-color: #ff5f57; }
+QPushButton#tlMin:hover { background-color: #ffcd4a; color: rgba(96, 64, 0, 0.65); }
+QPushButton#tlMax:hover { background-color: #43d95c; color: rgba(0, 70, 15, 0.6); }
+QPushButton#tlClose:hover { background-color: #ff7b74; color: rgba(96, 15, 8, 0.65); }
+QPushButton#tlMin:pressed { background-color: #e5a523; }
+QPushButton#tlMax:pressed { background-color: #1fa834; }
+QPushButton#tlClose:pressed { background-color: #e04b43; }
 
 /* Tooltip (Apple 深色胶囊) */
 QToolTip {
@@ -1049,15 +1051,17 @@ class TitleBar(QWidget):
         lay.addWidget(title)
         lay.addStretch()
 
-        self.min_btn = QPushButton("\u2014")   # —
-        self.max_btn = QPushButton("\u25A1")   # □
-        self.close_btn = QPushButton("\u2715")  # ✕
-        for b in (self.min_btn, self.max_btn, self.close_btn):
-            b.setObjectName("winBtn")
-            b.setFixedSize(34, 26)
+        # macOS 红绿灯：常显彩色圆点，悬停时符号淡入
+        self.min_btn = QPushButton("–")   # –
+        self.max_btn = QPushButton("□")   # □
+        self.close_btn = QPushButton("✕")  # ✕
+        for b, name in ((self.min_btn, "tlMin"), (self.max_btn, "tlMax"),
+                        (self.close_btn, "tlClose")):
+            b.setObjectName(name)
+            b.setFixedSize(16, 16)
             b.setCursor(Qt.PointingHandCursor)
             lay.addWidget(b)
-        self.close_btn.setObjectName("closeBtn")
+        lay.addSpacing(4)
         self.max_btn.setToolTip("最大化 / 还原（双击标题栏同效）")
         self.min_btn.setToolTip("最小化")
         self.close_btn.setToolTip("关闭")
