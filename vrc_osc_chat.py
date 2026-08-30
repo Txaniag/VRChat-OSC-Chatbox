@@ -35,7 +35,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QListView, QAbstractItemView, QGroupBox, QStatusBar,
     QMessageBox, QComboBox, QRadioButton, QButtonGroup, QScrollArea, QFrame,
     QDialog, QSlider, QSpinBox, QFormLayout, QDialogButtonBox, QSplitter,
-    QGraphicsBlurEffect, QGraphicsOpacityEffect, QStyledItemDelegate, QScrollBar
+    QGraphicsBlurEffect, QGraphicsOpacityEffect, QGraphicsDropShadowEffect, QStyledItemDelegate, QScrollBar
 )
 from PyQt5.QtCore import (
     Qt, QTimer, pyqtSignal, QObject, QPointF, QPoint, QRect, QRectF, QSize,
@@ -592,6 +592,30 @@ QDialog { background-color: #f0f8f0; }
 """
 
 
+# 下拉弹层视图专用样式：挂视图自身，保证透明容器下圆角/选中样式稳定
+POPUP_VIEW_QSS = """
+QListView {
+    background-color: rgba(248, 253, 248, 0.99);
+    color: #1a3a1a;
+    border: 1px solid rgba(52, 199, 89, 0.28);
+    border-radius: 12px;
+    outline: none;
+    padding: 6px;
+    selection-background-color: #2da44e;
+    selection-color: #ffffff;
+}
+QListView::item {
+    border-radius: 8px;
+    padding: 5px 10px;
+    margin: 1px 2px;
+    min-height: 22px;
+    background: transparent;
+}
+QListView::item:hover { background: rgba(52, 199, 89, 0.15); }
+QListView::item:selected { background: #2da44e; color: #ffffff; }
+"""
+
+
 def _ensure_check_png():
     """生成白色对勾 PNG（复选框选中态用），返回可供 QSS url() 使用的路径。
     用 QImage 而非 QPixmap：模块导入时 QApplication 还不存在。"""
@@ -947,6 +971,55 @@ class MicLevelBar(QWidget):
         if px > 2:
             p.setBrush(QColor(26, 58, 26, 110))
             p.drawRoundedRect(QRectF(px - 1, 1.5, 2, h - 3), 1, 1)
+
+
+# ============================================================
+# 带展开动画的下拉框 - 弹出菜单淡入 + 自上而下展开（140ms ease-out）
+# ============================================================
+class AnimatedComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._popup_anim = None
+
+    def showPopup(self):
+        if MOTION_OK:
+            w = self.view().window()
+            if w is not None:
+                w.setWindowOpacity(0.0)  # show 前先藏住，避免首帧闪现
+        super().showPopup()
+        if not MOTION_OK:
+            return
+        popup = self.view().window()
+        if popup is None:
+            return
+        final = QRect(popup.geometry())
+        # 自上而下展开：起始只露出顶部一条，同时轻微上浮归位
+        start_h = min(final.height(), 28)
+        start = QRect(final.x(), final.y() - 3, final.width(), start_h)
+        group = QParallelAnimationGroup(popup)
+        geo = QPropertyAnimation(popup, b"geometry", popup)
+        geo.setDuration(int(150 * MOTION_SCALE))
+        geo.setStartValue(start)
+        geo.setEndValue(QRect(final))
+        geo.setEasingCurve(_out_cubic())
+        op = QPropertyAnimation(popup, b"windowOpacity", popup)
+        op.setDuration(int(110 * MOTION_SCALE))
+        op.setStartValue(0.0)
+        op.setEndValue(1.0)
+        op.setEasingCurve(_out_cubic())
+        group.addAnimation(geo)
+        group.addAnimation(op)
+
+        def _done():
+            try:
+                popup.setWindowOpacity(1.0)  # 兜底：不能停在透明
+                popup.setGeometry(final)
+            except RuntimeError:
+                pass
+
+        group.finished.connect(_done)
+        group.start()
+        self._popup_anim = group
 
 
 # ============================================================
@@ -1320,7 +1393,7 @@ class FloatingTranslateWindow(QWidget):
         head.addWidget(title)
         head.addStretch()
 
-        self.source_combo = QComboBox()
+        self.source_combo = AnimatedComboBox()
         self.source_combo.setObjectName("floatCombo")
         for label, code in LANGUAGES:
             self.source_combo.addItem(label, code)
@@ -1331,7 +1404,7 @@ class FloatingTranslateWindow(QWidget):
         arrow.setObjectName("floatTitle")
         head.addWidget(arrow)
 
-        self.target_combo = QComboBox()
+        self.target_combo = AnimatedComboBox()
         self.target_combo.setObjectName("floatCombo")
         # 翻译方向固定为 其他语言 → 中文，中文排在首位作为默认
         for label, code in [("中文", "zh")] + TRANSLATE_LANGS:
@@ -1353,7 +1426,7 @@ class FloatingTranslateWindow(QWidget):
         dev_label = QLabel("捕获:")
         dev_label.setObjectName("floatStatus")
         dev_row.addWidget(dev_label)
-        self.device_combo = QComboBox()
+        self.device_combo = AnimatedComboBox()
         self.device_combo.setObjectName("floatCombo")
         self.device_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.device_combo.setToolTip("选择要捕获哪个扬声器/输出设备的音频")
@@ -1451,10 +1524,13 @@ class FloatingTranslateWindow(QWidget):
         self.setWindowOpacity(0.0)
         group = QParallelAnimationGroup(self)
         geo_anim = QPropertyAnimation(self, b"geometry", self)
-        geo_anim.setDuration(int(240 * MOTION_SCALE))
+        geo_anim.setDuration(int(260 * MOTION_SCALE))
         geo_anim.setStartValue(start)
         geo_anim.setEndValue(QRect(final))
-        geo_anim.setEasingCurve(_out_cubic())
+        # 几何带一点落定回弹（overshoot 0.6 ≈ 3%），透明度不带
+        ease = QEasingCurve(QEasingCurve.OutBack)
+        ease.setOvershoot(0.6)
+        geo_anim.setEasingCurve(ease)
         op_anim = QPropertyAnimation(self, b"windowOpacity", self)
         op_anim.setDuration(int(200 * MOTION_SCALE))
         op_anim.setStartValue(0.0)
@@ -2039,6 +2115,24 @@ class SettingsDialog(QDialog):
             self._entered = True
             rise_fade_in(self, duration=200, rise=12)
 
+    def done(self, result):
+        """关闭时 150ms 淡出再真正返回（退出比入场快）。"""
+        if MOTION_OK and self.isVisible() and self.windowOpacity() > 0.95:
+            anim = QPropertyAnimation(self, b"windowOpacity", self)
+            anim.setDuration(int(150 * MOTION_SCALE))
+            anim.setStartValue(1.0)
+            anim.setEndValue(0.0)
+            anim.setEasingCurve(_out_cubic())
+
+            def _fin():
+                QDialog.done(self, result)
+
+            anim.finished.connect(_fin)
+            anim.start()
+            self._close_anim = anim
+            return
+        QDialog.done(self, result)
+
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -2136,7 +2230,7 @@ class SettingsDialog(QDialog):
         self.trans_enabled_chk.setChecked(self._cfg.get("translate_enabled", False))
         trans_form.addRow("", self.trans_enabled_chk)
 
-        self.trans_lang_combo = QComboBox()
+        self.trans_lang_combo = AnimatedComboBox()
         for label, code in TRANSLATE_LANGS:
             self.trans_lang_combo.addItem(label, code)
         cur_target = self._cfg.get("translate_target", "en")
@@ -2146,7 +2240,7 @@ class SettingsDialog(QDialog):
                 break
         trans_form.addRow("目标语言:", self.trans_lang_combo)
 
-        self.trans_mode_combo = QComboBox()
+        self.trans_mode_combo = AnimatedComboBox()
         self.trans_mode_combo.addItem("双语显示（原文 + 译文）", "bilingual")
         self.trans_mode_combo.addItem("仅译文", "translated")
         cur_mode = self._cfg.get("translate_mode", "bilingual")
@@ -2545,6 +2639,8 @@ class MainWindow(QMainWindow):
 
         # 无边框窗口的边缘缩放手势（应用级事件过滤器）
         self._resizer = FramelessResizer(self)
+        # 下拉弹层：透明四角 + 去黑边/闪现
+        self._polish_combo_popups()
 
     # ----------------------------------------------------------
     # 创建所有控件（不组装布局）
@@ -2649,7 +2745,7 @@ class MainWindow(QMainWindow):
         trans_row.addWidget(self.translate_chk)
         trans_row.addSpacing(8)
         trans_row.addWidget(QLabel("目标:"))
-        self.translate_lang_combo = QComboBox()
+        self.translate_lang_combo = AnimatedComboBox()
         for label, code in TRANSLATE_LANGS:
             self.translate_lang_combo.addItem(label, code)
         self.translate_lang_combo.setCurrentIndex(0)  # 默认英语
@@ -2657,7 +2753,7 @@ class MainWindow(QMainWindow):
         trans_row.addWidget(self.translate_lang_combo)
         trans_row.addSpacing(8)
         trans_row.addWidget(QLabel("显示:"))
-        self.translate_mode_combo = QComboBox()
+        self.translate_mode_combo = AnimatedComboBox()
         self.translate_mode_combo.addItem("双语显示", "bilingual")
         self.translate_mode_combo.addItem("仅译文", "translated")
         self.translate_mode_combo.currentIndexChanged.connect(lambda: self._save_config())
@@ -2686,12 +2782,12 @@ class MainWindow(QMainWindow):
         # 设置行
         settings_row = QHBoxLayout()
         settings_row.addWidget(QLabel("麦克风:"))
-        self.mic_combo = QComboBox()
+        self.mic_combo = AnimatedComboBox()
         self.mic_combo.setMinimumWidth(120)
         settings_row.addWidget(self.mic_combo, stretch=1)
         settings_row.addSpacing(6)
         settings_row.addWidget(QLabel("语言:"))
-        self.lang_combo = QComboBox()
+        self.lang_combo = AnimatedComboBox()
         for label, code in LANGUAGES:
             self.lang_combo.addItem(label, code)
         self.lang_combo.setCurrentIndex(1)  # 默认中文
@@ -2973,6 +3069,12 @@ class MainWindow(QMainWindow):
                event.modifiers() & Qt.ControlModifier:
                 self._send()
                 return True
+        if isinstance(obj, QGroupBox) and self.isAncestorOf(obj):
+            if event.type() == QEvent.Enter:
+                self._animate_card_lift(obj, True)
+            elif event.type() == QEvent.Leave:
+                self._animate_card_lift(obj, False)
+            return False
         if obj is self.history_list.viewport() and event.type() == event.Resize:
             # 列表宽度变化 → 换行后的条目高度需要重算。
             # 高度没变跳过；且必须延迟到事件循环外（在布局事件里直接 dataChanged 会重入崩溃）
@@ -3049,9 +3151,109 @@ class MainWindow(QMainWindow):
         ]
 
     def _play_card_entrance(self):
+        """卡片级联入场：淡入 + 14px 上浮归位（50ms 间隔重叠展开）。"""
+        widgets = self._entrance_widgets()
+        step = int(50 * MOTION_SCALE)
+        dur = int(280 * MOTION_SCALE)
+        for i, w in enumerate(widgets):
+            try:
+                fade_in(w, duration=280, delay=i * step)
+            except RuntimeError:
+                continue
+            if not MOTION_OK:
+                continue
+
+            def _rise(w=w, delay=i * step, dur=dur):
+                try:
+                    geo = w.geometry()
+                    if geo.height() <= 0:
+                        return
+                    w.setGeometry(geo.x(), geo.y() + 14, geo.width(), geo.height())
+                    anim = QPropertyAnimation(w, b"geometry", w)
+                    anim.setDuration(dur)
+                    anim.setStartValue(w.geometry())
+                    anim.setEndValue(geo)
+                    anim.setEasingCurve(_out_cubic())
+                    anim.start()
+                    w._card_rise = anim
+                except RuntimeError:
+                    pass
+
+            # 延迟到期才位移（淡入未开始时卡片不可见，位移不会被看到）
+            QTimer.singleShot(delay, _rise)
+        total = int((step * len(widgets) + 320 + 120) * MOTION_SCALE)
+        # 入场用的透明度特效会顶掉阴影特效，入场结束后统一补挂玻璃阴影
+        QTimer.singleShot(total, self._apply_glass_shadows)
+
+
+    def _apply_glass_shadows(self):
+        """给玻璃卡片挂悬浮阴影，并安装 hover 浮起动效过滤。"""
+        for group in self.findChildren(QGroupBox):
+            effect = group.graphicsEffect()
+            if not isinstance(effect, QGraphicsDropShadowEffect):
+                effect = QGraphicsDropShadowEffect(self)
+                effect.setBlurRadius(16)
+                effect.setOffset(0, 5)
+                effect.setColor(QColor(20, 80, 40, 42))
+                group.setGraphicsEffect(effect)
+                group.installEventFilter(self)
+        for group in self.float_win.findChildren(QGroupBox):
+            pass  # 悬浮窗卡片尺寸贴合窗口，阴影会被裁剪，跳过
+
+    def _animate_card_lift(self, obj, enter):
+        """hover 时阴影扩散产生卡片浮起感（180ms OutCubic）。"""
+        effect = obj.graphicsEffect()
+        if not isinstance(effect, QGraphicsDropShadowEffect) or not MOTION_OK:
+            return
+        for prop, target in (
+            ("blurRadius", 28 if enter else 16),
+            ("yOffset", 10 if enter else 5),
+        ):
+            anim = QPropertyAnimation(effect, prop.encode("ascii"), obj)
+            anim.setDuration(int(180 * MOTION_SCALE))
+            anim.setEndValue(target)
+            anim.setEasingCurve(_out_cubic())
+            anim.start(QPropertyAnimation.DeleteWhenStopped)
+
+    def _polish_combo_popups(self):
+        """下拉弹层：四角真正透明 + 去黑边/闪现（恢复 v4.1 UI overhaul 的处理）。"""
+        for combo in self.findChildren(QComboBox) + self.float_win.findChildren(QComboBox):
+            view = combo.view()
+            if view is None:
+                continue
+            container = view.window()
+            if container is None:
+                continue
+            try:
+                # 弹层视图挂专用样式：透明容器下圆角/选中样式稳定生效
+                view.setStyleSheet(POPUP_VIEW_QSS)
+                # 隐藏弹层滚动条（滚轮仍可滚动），避免突兀
+                view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                # 容器四角透明：圆角由视图 QSS 绘制，四角露出下方内容而非黑色
+                container.setAttribute(Qt.WA_TranslucentBackground)
+                container.setWindowFlags(
+                    Qt.Popup | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint
+                )
+                self._disable_native_frame_rendering(container)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _disable_native_frame_rendering(container):
+        """禁用 DWM 对弹窗的原生边框渲染并关闭系统过渡动画，避免打开瞬间闪黑。"""
+        if sys.platform != "win32":
+            return
         try:
-            stagger_fade(self._entrance_widgets(), duration=240, step=50)
-        except RuntimeError:
+            hwnd = int(container.winId())
+            dwm = ctypes.windll.dwmapi
+            val = ctypes.c_int(1)  # DWMNCRP_DISABLED
+            dwm.DwmSetWindowAttribute(hwnd, 2, ctypes.byref(val), ctypes.sizeof(val))
+            none_color = ctypes.c_uint(0xFFFFFFFE)  # DWMWA_COLOR_NONE
+            dwm.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(none_color), ctypes.sizeof(none_color))
+            trans = ctypes.c_int(1)  # DWMWA_TRANSITIONS_FORCEDISABLED
+            dwm.DwmSetWindowAttribute(hwnd, 3, ctypes.byref(trans), ctypes.sizeof(trans))
+        except Exception:
             pass
 
     # ----------------------------------------------------------
@@ -3143,6 +3345,33 @@ class MainWindow(QMainWindow):
     def _repolish(self, widget):
         widget.style().unpolish(widget)
         widget.style().polish(widget)
+
+    def _btn_swap_beat(self, btn):
+        """状态切换（换 objectName）后的 160ms 渐显过渡拍，替代硬切。"""
+        if not MOTION_OK:
+            return
+        try:
+            effect = QGraphicsOpacityEffect(btn)
+            effect.setOpacity(0.45)
+            btn.setGraphicsEffect(effect)
+            anim = QPropertyAnimation(effect, b"opacity", btn)
+            anim.setDuration(int(160 * MOTION_SCALE))
+            anim.setStartValue(0.45)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(_out_cubic())
+
+            def _cleanup():
+                try:
+                    if btn.graphicsEffect() is effect:
+                        btn.setGraphicsEffect(None)
+                except RuntimeError:
+                    pass
+
+            anim.finished.connect(_cleanup)
+            btn._swap_beat_anim = anim
+            anim.start()
+        except RuntimeError:
+            pass
 
     # ----------------------------------------------------------
     # 发送
@@ -3243,9 +3472,37 @@ class MainWindow(QMainWindow):
     def _update_char_count(self):
         length = len(self.text_input.toPlainText())
         limit = self._max_chars
-        color = "#ff3b30" if length > limit else ("#ff9500" if length > limit * 0.8 else "#6b8f6b")
+        target = QColor("#ff3b30" if length > limit else ("#ff9500" if length > limit * 0.8 else "#6b8f6b"))
         self.char_label.setText(f"{length} / {limit} 字符")
-        self.char_label.setStyleSheet(f"color: {color};")
+        self._animate_char_color(target)
+
+    def _animate_char_color(self, target):
+        """字数警示颜色 180ms 渐变过渡（绿→橙→红不再瞬切）。"""
+        cur = getattr(self, "_char_color", None)
+        if cur is None:
+            cur = QColor("#6b8f6b")
+        if cur == target:
+            self.char_label.setStyleSheet(f"color: {target.name()};")
+            return
+        self._char_color = QColor(target)
+        old = self.char_label
+        anim = QVariantAnimation(self)
+        anim.setDuration(int(180 * MOTION_SCALE))
+        anim.setStartValue(QColor(cur))
+        anim.setEndValue(QColor(target))
+        anim.setEasingCurve(_out_cubic())
+        label = self.char_label
+
+        def _apply(val):
+            try:
+                c = QColor(val)
+                label.setStyleSheet(f"color: {c.name()};")
+            except RuntimeError:
+                pass
+
+        anim.valueChanged.connect(_apply)
+        anim.start()
+        self._char_color_anim = anim
 
     def _clear_text(self):
         self.text_input.clear()
@@ -3439,6 +3696,8 @@ class MainWindow(QMainWindow):
         self.speaker_btn.setText("⏹  停止翻译" if active else "🖥  悬浮翻译 BETA")
         self.speaker_btn.setObjectName("speakerBtnActive" if active else "speakerBtn")
         self._repolish(self.speaker_btn)
+        if not active:
+            self._btn_swap_beat(self.speaker_btn)  # 恢复闲置态渐显过渡
 
     def _on_speaker_finished(self):
         # 引擎自然结束（错误/停止）时统一复位 UI
@@ -3533,10 +3792,13 @@ class MainWindow(QMainWindow):
         self.ptt_btn.setText("🎤  按住说话")
         self.ptt_btn.setObjectName("micBtn")
         self._repolish(self.ptt_btn)
+        self._btn_swap_beat(self.ptt_btn)
         self.ptt_btn.setEnabled(True)
 
         self.continuous_btn.setText("🔄  连续监听")
         self.continuous_btn.setObjectName("micContinuous")
+        self._repolish(self.continuous_btn)
+        self._btn_swap_beat(self.continuous_btn)
         self._repolish(self.continuous_btn)
         self.continuous_btn.setEnabled(True)
 
