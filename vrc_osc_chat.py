@@ -1512,6 +1512,15 @@ class FloatingTranslateWindow(QWidget):
         self.level_bar.setVisible(False)
 
     def show_at(self, geo):
+        # 取消正在进行的退场淡出：快速"停止→再打开"时，
+        # 淡出完成的回调会把刚打开的窗口藏掉
+        self._fade_closing = False
+        fade = getattr(self, "_fade_anim", None)
+        try:
+            if fade is not None and fade.state() == QPropertyAnimation.Running:
+                fade.stop()
+        except RuntimeError:
+            pass
         if geo and len(geo) == 4:
             x, y, w, h = geo
             if w == self.width() and h == self.height():
@@ -1563,6 +1572,7 @@ class FloatingTranslateWindow(QWidget):
         if not MOTION_OK:
             self.hide()
             return
+        self._fade_closing = True
         anim = QPropertyAnimation(self, b"windowOpacity", self)
         anim.setDuration(int(150 * MOTION_SCALE))
         anim.setStartValue(self.windowOpacity())
@@ -1570,8 +1580,10 @@ class FloatingTranslateWindow(QWidget):
         anim.setEasingCurve(_out_cubic())
 
         def _done():
-            self.hide()
-            self.setWindowOpacity(1.0)
+            # 期间被重新打开（_fade_closing 被置 False）则不隐藏
+            if getattr(self, "_fade_closing", False):
+                self.hide()
+                self.setWindowOpacity(1.0)
 
         anim.finished.connect(_done)
         self._fade_anim = anim
@@ -1620,6 +1632,11 @@ class FloatingTranslateWindow(QWidget):
         """用户点 ✕ = 完全停止：先淡出，再通知主窗口停引擎、复位按钮。"""
         self.fade_hide()
         self.closedByUser.emit()
+
+    def closeEvent(self, event):
+        # 无论哪种方式关闭，都要停掉电平条轮询计时器
+        self.level_bar.stop()
+        super().closeEvent(event)
 
     # ---- 拖动 ----
     def mousePressEvent(self, event):
@@ -3266,6 +3283,8 @@ class MainWindow(QMainWindow):
     def _open_settings(self):
         cfg = self._get_current_config()
         dlg = SettingsDialog(cfg, self)
+        # 对话框里的下拉框也套弹层美化（透明四角/去黑边）
+        self._polish_combo_popups()
         if dlg.exec_() == QDialog.Accepted:
             new_cfg = dlg.get_config()
             old_mode = self._layout_mode
@@ -3318,7 +3337,8 @@ class MainWindow(QMainWindow):
             "baidu_secret": self.translator._baidu_secret,
             "speaker_source": self.float_win.source_lang(),
             "speaker_target": self.float_win.target_lang(),
-            "speaker_device": self.float_win.current_device_name(),
+            # 设备下拉未填充（如启动早期）时保留已保存的设备名，避免覆盖丢失
+            "speaker_device": self.float_win.current_device_name() or getattr(self, "_speaker_device_name", ""),
             "speaker_beta_hint_off": getattr(self, "_speaker_beta_hint_off", False),
             "float_geo": self.float_win.save_geo(),
         }
@@ -3545,7 +3565,10 @@ class MainWindow(QMainWindow):
         self.continuous_btn.setEnabled(False)
         self.mic_combo.setEnabled(False)
         self.lang_combo.setEnabled(False)
-        self.voice_hint.setText("正在录音... 再次点击停止并识别")
+        hint = "正在录音... 再次点击停止并识别"
+        if self.translate_chk.isChecked():
+            hint += f"（翻译已开启，输出 {self.translate_lang_combo.currentText()}）"
+        self.voice_hint.setText(hint)
         self.voice.start_ptt(
             device_index=self.mic_combo.currentData(),
             language=self.lang_combo.currentData() or "zh"
@@ -3575,7 +3598,11 @@ class MainWindow(QMainWindow):
         self.ptt_btn.setEnabled(False)
         self.mic_combo.setEnabled(False)
         self.lang_combo.setEnabled(False)
-        self.voice_hint.setText("连续监听中，说话后会自动识别")
+        hint = "连续监听中，说话后会自动识别"
+        if self.translate_chk.isChecked():
+            tgt = self.translate_lang_combo.currentText()
+            hint += f"（翻译已开启，输出 {tgt}）"
+        self.voice_hint.setText(hint)
         self.voice.start_continuous(
             device_index=self.mic_combo.currentData(),
             language=self.lang_combo.currentData() or "zh"
