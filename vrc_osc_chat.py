@@ -11,6 +11,12 @@ VRChat OSC Chatbox Sender (PyQt5 + sherpa-onnx SenseVoice)
 import sys
 import os
 import json
+import re
+import math
+import time
+import ctypes
+import tempfile
+from collections import deque
 import datetime
 import threading
 import queue
@@ -26,13 +32,20 @@ import keyboard
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QTextEdit, QPushButton, QCheckBox, QListWidget,
-    QGroupBox, QStatusBar, QMessageBox, QComboBox, QRadioButton, QButtonGroup,
-    QScrollArea, QFrame, QDialog, QSlider, QSpinBox, QFormLayout,
-    QDialogButtonBox, QSplitter, QGraphicsBlurEffect, QGraphicsDropShadowEffect,
-    QStyledItemDelegate, QAbstractItemView
+    QListWidgetItem, QListView, QAbstractItemView, QGroupBox, QStatusBar,
+    QMessageBox, QComboBox, QRadioButton, QButtonGroup, QScrollArea, QFrame,
+    QDialog, QSlider, QSpinBox, QFormLayout, QDialogButtonBox, QSplitter,
+    QGraphicsBlurEffect, QGraphicsOpacityEffect, QStyledItemDelegate, QScrollBar
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPointF, QPropertyAnimation, QEasingCurve, QSize, QPoint
-from PyQt5.QtGui import QIcon, QPainter, QRadialGradient, QColor, QBrush, QLinearGradient, QPixmap, QPen
+from PyQt5.QtCore import (
+    Qt, QTimer, pyqtSignal, QObject, QPointF, QPoint, QRect, QRectF, QSize,
+    QEvent,
+    QPropertyAnimation, QParallelAnimationGroup, QVariantAnimation, QEasingCurve
+)
+from PyQt5.QtGui import (
+    QIcon, QPainter, QRadialGradient, QColor, QBrush, QLinearGradient,
+    QPixmap, QPen, QCursor
+)
 from pythonosc import udp_client
 
 # ============================================================
@@ -64,7 +77,7 @@ VAD_MODEL = os.path.join(MODEL_DIR, "silero_vad.onnx")
 # 常量
 # ============================================================
 APP_TITLE = "VRChat OSC Chatbox Sender"
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.2.0"
 DEFAULT_IP = "127.0.0.1"
 DEFAULT_PORT = 9000
 MAX_CHARS = 144
@@ -86,304 +99,323 @@ LANGUAGES = [
 
 # Apple 风格主题 - 基于 Apple Human Interface Guidelines
 # 原则: 毛玻璃卡片, 极光背景, Bento Grid, 胶囊按钮, 系统字体
-STYLE_SHEET = """
-QMainWindow, QWidget {
-    background-color: #eefaf7;
-    color: #0e3f3a;
+# 注意: 基础 QWidget 背景必须透明, 否则会盖住主窗口 paintEvent 画的极光
+_STYLE_SHEET_TEMPLATE = """
+QMainWindow {
+    background-color: #f0f8f0;
+    color: #1a3a1a;
     font-family: -apple-system, "SF Pro Text", "SF Pro", "PingFang SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
     font-size: 10pt;
 }
+QWidget {
+    background: transparent;
+    color: #1a3a1a;
+    font-family: -apple-system, "SF Pro Text", "SF Pro", "PingFang SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
+    font-size: 10pt;
+}
+QSplitter { background: transparent; }
+QSplitter::handle { background: transparent; }
 
-/* ---- Glass Cards (薄荷玻璃拟态) ---- */
+/* ---- Bento Cards (淡绿毛玻璃) ---- */
 QGroupBox {
-    background-color: rgba(255, 255, 255, 0.58);
-    border: 1px solid rgba(255, 255, 255, 0.85);
-    border-radius: 22px;
-    margin-top: 20px;
-    padding: 18px 16px 14px 16px;
+    background-color: rgba(245, 255, 245, 0.88);
+    border: 1px solid rgba(52, 199, 89, 0.12);
+    border-radius: 20px;
+    margin-top: 6px;
+    padding: 42px 14px 14px 14px;
     font-weight: 600;
 }
+/* 标题放卡片内部左上角：原来 subcontrol-origin: margin + 固定 18px margin-top
+   在不同字号/DPI 下标题会整行飘到卡片外，改为内部标题彻底规避 */
 QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 18px;
-    padding: 0 10px;
-    color: #0e3f3a;
+    subcontrol-origin: border;
+    subcontrol-position: top left;
+    left: 14px;
+    top: 14px;
+    padding: 0 8px;
+    color: #1a3a1a;
     font-size: 11pt;
     font-weight: 700;
-    letter-spacing: 0.02em;
 }
 
 /* ---- Labels ---- */
-QLabel { background: transparent; color: #0e3f3a; }
-QLabel#dimLabel { color: #5f8a83; font-size: 9pt; }
+QLabel { background: transparent; color: #1a3a1a; }
+QLabel#dimLabel { color: #6b8f6b; font-size: 9pt; }
 QLabel#titleLabel {
-    color: #0b332f; font-size: 18pt; font-weight: 800;
+    color: #1a3a1a; font-size: 17pt; font-weight: 700;
     letter-spacing: -0.02em;
 }
-QLabel#connOk { color: #0ea98b; font-size: 9pt; font-weight: 600; }
-QLabel#connErr { color: #f43f5e; font-size: 9pt; font-weight: 600; }
+QLabel#connOk { color: #2da44e; font-size: 9pt; font-weight: 500; }
+QLabel#connErr { color: #ff3b30; font-size: 9pt; font-weight: 500; }
 QLabel#partialLabel {
-    color: #0ea98b; font-style: italic; font-size: 9pt;
+    color: #6b8f6b; font-style: italic; font-size: 9pt;
     padding: 4px 0;
 }
 QLabel#offlineBadge {
-    color: #0b9e82; font-size: 8pt; font-weight: 700;
-    border: 1px solid rgba(20, 184, 166, 0.35); border-radius: 18px;
-    padding: 3px 12px;
-    background: rgba(45, 212, 191, 0.12);
+    color: #2da44e; font-size: 8pt; font-weight: 700;
+    border: 1px solid rgba(45, 164, 78, 0.3); border-radius: 8px;
+    padding: 2px 10px;
+    background: rgba(45, 164, 78, 0.08);
 }
 QLabel#listeningBadge {
-    color: #e07b00; font-size: 8pt; font-weight: 700;
-    border: 1px solid rgba(255, 159, 67, 0.4); border-radius: 18px;
-    padding: 3px 12px;
-    background: rgba(255, 159, 67, 0.12);
+    color: #ff9500; font-size: 8pt; font-weight: 700;
+    border: 1px solid rgba(255, 149, 0, 0.3); border-radius: 8px;
+    padding: 2px 10px;
+    background: rgba(255, 149, 0, 0.08);
 }
-QLabel#vadLevel { color: #0ea98b; font-size: 9pt; }
+QLabel#vadLevel { color: #2da44e; font-size: 9pt; }
 
-/* ---- Inputs ---- */
+/* ---- Inputs (无边框, 浅绿背景) ---- */
 QLineEdit, QTextEdit, QListWidget {
-    background-color: rgba(255, 255, 255, 0.55);
-    color: #0e3f3a;
-    border: 1.5px solid rgba(15, 118, 110, 0.10);
-    border-radius: 14px;
-    padding: 8px 14px;
-    selection-background-color: #2dd4bf;
+    background-color: #ebf5eb;
+    color: #1a3a1a;
+    border: 1.5px solid transparent;
+    border-radius: 12px;
+    padding: 8px 12px;
+    selection-background-color: #34c759;
     selection-color: #ffffff;
 }
 QLineEdit:focus, QTextEdit:focus, QListWidget:focus {
-    background-color: rgba(255, 255, 255, 0.92);
-    border: 1.5px solid #2dd4bf;
+    background-color: #ffffff;
+    border: 1.5px solid #34c759;
+}
+QLineEdit:disabled, QTextEdit:disabled {
+    background-color: #e4eee4;
+    color: #93ab93;
+    border: 1.5px solid transparent;
 }
 QListWidget {
-    background-color: rgba(255, 255, 255, 0.42);
-    border-radius: 16px;
+    background-color: rgba(245, 255, 245, 0.7);
+    border: 1px solid rgba(52, 199, 89, 0.08);
+    border-radius: 12px;
 }
 QListWidget::item {
-    border-radius: 10px;
-    padding: 5px 10px;
+    border-radius: 8px;
+    padding: 4px 8px;
 }
-QListWidget::item:hover { background: rgba(45, 212, 191, 0.10); }
+QListWidget::item:hover { background: rgba(52, 199, 89, 0.06); }
 QListWidget::item:selected {
-    background: rgba(45, 212, 191, 0.18);
-    color: #0b7f68;
+    background: rgba(52, 199, 89, 0.12);
+    color: #2da44e;
 }
 
-/* ---- Buttons: 全胶囊 ---- */
+/* ---- Button Hierarchy ---- */
+/* Secondary (默认) */
 QPushButton {
-    background-color: rgba(255, 255, 255, 0.65);
-    color: #0e3f3a;
-    border: 1px solid rgba(15, 118, 110, 0.14);
-    border-radius: 18px;
-    padding: 10px 22px;
+    background-color: #d4e8d4;
+    color: #1a3a1a;
+    border: none;
+    border-radius: 12px;
+    padding: 7px 20px;
     font-weight: 600;
     font-size: 10pt;
 }
-QPushButton:hover {
-    background-color: rgba(255, 255, 255, 0.9);
-    border: 1px solid rgba(45, 212, 191, 0.45);
-}
-QPushButton:pressed { background-color: rgba(45, 212, 191, 0.15); }
+QPushButton:hover { background-color: #c0dec0; }
+QPushButton:pressed { background-color: #b0d4b0; }
 QPushButton:disabled {
-    color: #9dbbb5;
-    background-color: rgba(255, 255, 255, 0.4);
-    border: 1px solid rgba(15, 118, 110, 0.06);
+    background-color: #dcecdc;
+    color: #9db89d;
 }
 
-/* Primary (发送) - 薄荷渐变 */
+/* Primary (发送) */
 QPushButton#sendBtn {
-    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 #43e0b0, stop:1 #21c9a8);
+    background-color: #2da44e;
     color: #ffffff;
     border: none;
-    border-radius: 18px;
-    padding: 12px 32px;
+    border-radius: 12px;
+    padding: 10px 28px;
     font-size: 11pt;
-    font-weight: 700;
+    font-weight: 600;
 }
-QPushButton#sendBtn:hover {
-    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 #52e8bc, stop:1 #2bd6b3);
-}
-QPushButton#sendBtn:pressed {
-    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 #2fcfa2, stop:1 #17b795);
-}
+QPushButton#sendBtn:hover { background-color: #2cb359; }
+QPushButton#sendBtn:pressed { background-color: #269a45; }
 QPushButton#sendBtn:disabled {
-    background-color: rgba(15, 118, 110, 0.15);
-    color: #9dbbb5;
+    background-color: #c0d4c0;
+    color: #8fb58f;
 }
 
 /* Mic PTT */
 QPushButton#micBtn {
-    background-color: rgba(45, 212, 191, 0.14);
-    color: #0b7f68;
-    border: 1.5px solid rgba(45, 212, 191, 0.4);
-    border-radius: 18px;
-    padding: 11px 24px;
+    background-color: rgba(45, 164, 78, 0.12);
+    color: #1a7a37;
+    border: 1.5px solid rgba(45, 164, 78, 0.3);
+    border-radius: 12px;
+    padding: 8px 20px;
     font-size: 10pt;
     font-weight: 600;
 }
 QPushButton#micBtn:hover {
-    background-color: rgba(45, 212, 191, 0.24);
-    border: 1.5px solid rgba(45, 212, 191, 0.6);
+    background-color: rgba(45, 164, 78, 0.2);
+    border: 1.5px solid rgba(45, 164, 78, 0.5);
 }
-QPushButton#micBtn:pressed { background-color: rgba(45, 212, 191, 0.32); }
+QPushButton#micBtn:pressed { background-color: rgba(45, 164, 78, 0.08); }
 QPushButton#micBtn:disabled {
-    color: #9dbbb5;
-    border: 1.5px solid rgba(15, 118, 110, 0.08);
-    background: rgba(255, 255, 255, 0.35);
+    color: #b0c8b0;
+    border: 1.5px solid rgba(0, 0, 0, 0.06);
+    background: rgba(0, 0, 0, 0.03);
 }
 
 /* Recording */
 QPushButton#micRecording {
-    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 #ff6b8b, stop:1 #f43f5e);
+    background-color: #ff3b30;
     color: #ffffff;
     border: none;
-    border-radius: 18px;
-    padding: 11px 24px;
+    border-radius: 12px;
+    padding: 8px 20px;
     font-size: 10pt;
-    font-weight: 700;
+    font-weight: 600;
 }
-QPushButton#micRecording:hover { background-color: #ff5470; }
-QPushButton#micRecording:pressed { background-color: #e11d48; }
+QPushButton#micRecording:hover { background-color: #ff453a; }
+QPushButton#micRecording:pressed { background-color: #d70015; }
 
 /* Continuous */
 QPushButton#micContinuous {
-    background-color: rgba(255, 159, 67, 0.12);
-    color: #d97706;
-    border: 1.5px solid rgba(255, 159, 67, 0.35);
-    border-radius: 18px;
-    padding: 11px 24px;
+    background-color: rgba(255, 149, 0, 0.12);
+    color: #c93400;
+    border: 1.5px solid rgba(255, 149, 0, 0.3);
+    border-radius: 12px;
+    padding: 8px 20px;
     font-size: 10pt;
     font-weight: 600;
 }
 QPushButton#micContinuous:hover {
-    background-color: rgba(255, 159, 67, 0.2);
-    border: 1.5px solid rgba(255, 159, 67, 0.55);
+    background-color: rgba(255, 149, 0, 0.2);
+    border: 1.5px solid rgba(255, 149, 0, 0.5);
 }
-QPushButton#micContinuous:pressed { background-color: rgba(255, 159, 67, 0.28); }
+QPushButton#micContinuous:pressed { background-color: rgba(255, 149, 0, 0.08); }
+QPushButton#micContinuous:disabled {
+    color: #d4bb9a;
+    border: 1.5px solid rgba(0, 0, 0, 0.06);
+    background: rgba(0, 0, 0, 0.03);
+}
 
 QPushButton#micContinuousActive {
-    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 #ffb347, stop:1 #ff9f43);
+    background-color: #ff9500;
     color: #ffffff;
     border: none;
-    border-radius: 18px;
-    padding: 11px 24px;
+    border-radius: 12px;
+    padding: 8px 20px;
     font-size: 10pt;
-    font-weight: 700;
+    font-weight: 600;
 }
-QPushButton#micContinuousActive:hover { background-color: #ffab2e; }
-QPushButton#micContinuousActive:pressed { background-color: #f08c00; }
+QPushButton#micContinuousActive:hover { background-color: #ffa00a; }
+QPushButton#micContinuousActive:pressed { background-color: #e68600; }
 
 /* ComboBox */
 QComboBox {
-    background-color: rgba(255, 255, 255, 0.55);
-    color: #0e3f3a;
-    border: 1.5px solid rgba(15, 118, 110, 0.10);
-    border-radius: 18px;
-    padding: 5px 14px;
+    background-color: #ebf5eb;
+    color: #1a3a1a;
+    border: 1.5px solid transparent;
+    border-radius: 10px;
+    padding: 5px 10px;
     min-width: 70px;
 }
-QComboBox:hover { background-color: rgba(255, 255, 255, 0.85); }
-QComboBox:focus { border: 1.5px solid #2dd4bf; }
-QComboBox::drop-down { border: none; width: 24px; background: transparent; }
+QComboBox:hover { background-color: #dcecdc; }
+QComboBox:focus { background-color: #ffffff; border: 1.5px solid #34c759; }
+QComboBox:disabled { background-color: #e4eee4; color: #93ab93; }
+QComboBox::drop-down { border: none; width: 22px; }
 QComboBox::down-arrow {
-    image: url(@ARROW@);
-    width: 12px; height: 8px;
-    margin-right: 10px;
+    width: 0; height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid #6b8f6b;
+    margin-right: 8px;
 }
 QComboBox QAbstractItemView {
-    background-color: rgba(255, 255, 255, 0.98);
-    color: #0e3f3a;
-    selection-background-color: #2dd4bf;
+    background-color: rgba(245, 255, 245, 0.98);
+    color: #1a3a1a;
+    selection-background-color: #2da44e;
     selection-color: #ffffff;
-    border: 1.5px solid rgba(45, 212, 191, 0.40);
-    border-radius: 14px;
+    border: 1px solid rgba(52, 199, 89, 0.12);
+    border-radius: 12px;
     outline: none;
-    padding: 6px;
+    padding: 4px;
 }
 QComboBox QAbstractItemView::item {
-    border-radius: 8px;
-    padding: 5px 10px;
-    margin: 1px 2px;
-    min-height: 20px;
-    background: transparent;
+    border-radius: 6px;
+    padding: 4px 8px;
+    min-height: 22px;
 }
-QComboBox QAbstractItemView::item:hover { background: rgba(45, 212, 191, 0.15); }
-QComboBox QAbstractItemView::item:selected { background: #2dd4bf; color: #ffffff; }
 
 /* Checkbox */
-QCheckBox { background: transparent; spacing: 8px; color: #0e3f3a; }
+QCheckBox { background: transparent; spacing: 8px; color: #1a3a1a; }
+QCheckBox:disabled { color: #9db89d; }
 QCheckBox::indicator {
-    width: 18px; height: 18px;
-    border-radius: 6px;
-    border: 1.5px solid rgba(15, 118, 110, 0.25);
-    background: rgba(255, 255, 255, 0.6);
+    width: 17px; height: 17px;
+    border-radius: 5px;
+    border: 1.5px solid #b0c8b0;
+    background: #ebf5eb;
 }
-QCheckBox::indicator:hover { border: 1.5px solid #2dd4bf; }
+QCheckBox::indicator:hover { border: 1.5px solid #6b8f6b; }
 QCheckBox::indicator:checked {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 #43e0b0, stop:1 #21c9a8);
-    border: 1.5px solid transparent;
+    background-color: #2da44e;
+    border: 1.5px solid #2da44e;
+    image: url(__CHECK_URL__);
+}
+QCheckBox::indicator:disabled {
+    border: 1.5px solid #d4e4d4;
+    background: #e4eee4;
 }
 
 /* Radio */
-QRadioButton { background: transparent; spacing: 8px; color: #0e3f3a; }
+QRadioButton { background: transparent; spacing: 8px; color: #1a3a1a; }
 QRadioButton::indicator {
-    width: 16px; height: 16px;
-    border-radius: 8px;
-    border: 1.5px solid rgba(15, 118, 110, 0.25);
-    background: rgba(255, 255, 255, 0.6);
+    width: 17px; height: 17px;
+    border-radius: 9px;
+    border: 1.5px solid #b0c8b0;
+    background: #ebf5eb;
 }
-QRadioButton::indicator:hover { border: 1.5px solid #2dd4bf; }
+QRadioButton::indicator:hover { border: 1.5px solid #6b8f6b; }
 QRadioButton::indicator:checked {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 #43e0b0, stop:1 #21c9a8);
-    border: 2px solid #ffffff;
+    background: #ffffff;
+    border: 5px solid #2da44e;
+}
+QRadioButton::indicator:disabled {
+    border: 1.5px solid #d4e4d4;
+    background: #e4eee4;
 }
 
 /* Hotkey btn */
 QPushButton#hotkeyBtn {
-    background-color: rgba(45, 212, 191, 0.10);
-    color: #0b7f68;
-    border: 1.5px dashed rgba(45, 212, 191, 0.45);
-    border-radius: 18px;
-    padding: 11px 14px;
+    background-color: #ebf5eb;
+    color: #2da44e;
+    border: 1.5px dashed rgba(45, 164, 78, 0.3);
+    border-radius: 10px;
+    padding: 4px 12px;
     font-weight: 600;
     min-width: 70px;
 }
 QPushButton#hotkeyBtn:hover {
-    border: 1.5px dashed rgba(45, 212, 191, 0.8);
-    background-color: rgba(45, 212, 191, 0.16);
+    border: 1.5px dashed rgba(45, 164, 78, 0.6);
+    background-color: rgba(45, 164, 78, 0.05);
 }
 QPushButton#hotkeyBtn:pressed {
-    background-color: rgba(45, 212, 191, 0.24);
+    background-color: rgba(45, 164, 78, 0.1);
 }
 
 /* Settings btn */
 QPushButton#settingsBtn {
-    background-color: rgba(255, 255, 255, 0.55);
-    color: #0b7f68;
-    border: 1px solid rgba(45, 212, 191, 0.25);
-    border-radius: 18px;
-    padding: 11px 18px;
+    background-color: rgba(245, 255, 245, 0.7);
+    color: #2da44e;
+    border: 1px solid rgba(52, 199, 89, 0.1);
+    border-radius: 12px;
+    padding: 5px 16px;
     font-weight: 600;
 }
 QPushButton#settingsBtn:hover {
-    background-color: rgba(255, 255, 255, 0.9);
-    border: 1px solid rgba(45, 212, 191, 0.5);
+    background-color: rgba(45, 164, 78, 0.06);
+    border: 1px solid rgba(45, 164, 78, 0.2);
 }
-QPushButton#settingsBtn:pressed { background-color: rgba(45, 212, 191, 0.16); }
+QPushButton#settingsBtn:pressed { background-color: rgba(45, 164, 78, 0.1); }
 
-/* Status bar - 悬浮玻璃条 */
+/* Status bar */
 QStatusBar {
-    background-color: rgba(255, 255, 255, 0.35);
-    color: #5f8a83;
-    border-top: 1px solid rgba(255, 255, 255, 0.5);
+    background-color: rgba(245, 255, 245, 0.7);
+    color: #6b8f6b;
+    border-top: 1px solid rgba(52, 199, 89, 0.08);
     font-size: 9pt;
 }
+QStatusBar::item { border: none; }
 
 /* Scroll */
 QScrollArea { background-color: transparent; border: none; }
@@ -394,80 +426,1159 @@ QScrollBar:vertical {
     margin: 4px;
 }
 QScrollBar::handle:vertical {
-    background: rgba(45, 212, 191, 0.28);
+    background: rgba(52, 199, 89, 0.2);
     border-radius: 4px;
     min-height: 30px;
 }
-QScrollBar::handle:vertical:hover { background: rgba(45, 212, 191, 0.5); }
+QScrollBar::handle:vertical:hover { background: rgba(52, 199, 89, 0.35); }
+QScrollBar::handle:vertical:pressed { background: rgba(52, 199, 89, 0.5); }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar:horizontal { height: 0; }
 
 /* Slider */
 QSlider::groove:horizontal {
-    background: rgba(15, 118, 110, 0.12);
+    background: #d4e8d4;
     height: 6px;
     border-radius: 3px;
 }
 QSlider::sub-page:horizontal {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 #43e0b0, stop:1 #21c9a8);
+    background: #2da44e;
     border-radius: 3px;
 }
 QSlider::handle:horizontal {
     background: #ffffff;
     width: 18px; height: 18px;
     border-radius: 9px;
-    border: 1px solid rgba(45, 212, 191, 0.35);
+    border: 1px solid rgba(52, 199, 89, 0.15);
     margin: -6px 0;
 }
 QSlider::handle:horizontal:hover {
-    border: 2px solid #21c9a8;
+    border: 2px solid #2da44e;
 }
 
 /* SpinBox */
 QSpinBox {
-    background-color: rgba(255, 255, 255, 0.55);
-    color: #0e3f3a;
-    border: 1.5px solid rgba(15, 118, 110, 0.10);
-    border-radius: 10px;
-    padding: 3px 8px;
-}
-QSpinBox:focus { background-color: rgba(255, 255, 255, 0.92); border: 1.5px solid #2dd4bf; }
-
-/* Dialog */
-QDialog { background-color: #eefaf7; }
-"""
-
-# 下拉弹层视图专用样式：直接挂在 view 上（自身样式表优先级最高、应用可靠；
-# 全局 QSS 对 QComboBox 弹层视图在主窗口环境中应用不稳定，会导致原生回退）
-POPUP_VIEW_QSS = """
-QListView {
-    background-color: #ffffff;
-    color: #0e3f3a;
-    border: 1.5px solid rgba(45, 212, 191, 0.40);
-    border-radius: 14px;
-    outline: none;
-    padding: 6px;
-    selection-background-color: #2dd4bf;
-    selection-color: #ffffff;
-}
-QListView::item {
+    background-color: #ebf5eb;
+    color: #1a3a1a;
+    border: 1.5px solid transparent;
     border-radius: 8px;
-    padding: 5px 10px;
-    margin: 1px 2px;
-    min-height: 20px;
+    padding: 3px 6px;
+}
+QSpinBox:focus { background-color: #ffffff; border: 1.5px solid #34c759; }
+QSpinBox:disabled { background-color: #e4eee4; color: #93ab93; }
+
+/* ---- 悬浮翻译按钮 ---- */
+QPushButton#speakerBtn {
+    background-color: rgba(53, 132, 228, 0.12);
+    color: #1c6ba0;
+    border: 1.5px solid rgba(53, 132, 228, 0.35);
+    border-radius: 12px;
+    padding: 8px 16px;
+    font-size: 10pt;
+    font-weight: 600;
+}
+QPushButton#speakerBtn:hover {
+    background-color: rgba(53, 132, 228, 0.2);
+    border: 1.5px solid rgba(53, 132, 228, 0.55);
+}
+QPushButton#speakerBtn:pressed { background-color: rgba(53, 132, 228, 0.08); }
+QPushButton#speakerBtn:disabled {
+    color: #9db4c8;
+    border: 1.5px solid rgba(0, 0, 0, 0.06);
+    background: rgba(0, 0, 0, 0.03);
+}
+QPushButton#speakerBtnActive {
+    background-color: #3574e4;
+    color: #ffffff;
+    border: none;
+    border-radius: 12px;
+    padding: 8px 16px;
+    font-size: 10pt;
+    font-weight: 600;
+}
+QPushButton#speakerBtnActive:hover { background-color: #4a83e8; }
+QPushButton#speakerBtnActive:pressed { background-color: #2c66c9; }
+
+/* ---- 悬浮翻译窗 (深色玻璃) ---- */
+QFrame#floatCard {
+    background-color: rgba(26, 36, 28, 238);
+    border: 1px solid rgba(126, 231, 135, 0.3);
+    border-radius: 16px;
+}
+QLabel#floatTitle {
+    color: #9fd8ac;
+    font-size: 10pt;
+    font-weight: 700;
     background: transparent;
 }
-QListView::item:hover { background: rgba(45, 212, 191, 0.15); }
-QListView::item:selected { background: #2dd4bf; color: #ffffff; }
+QLabel#floatStatus {
+    color: #8fae95;
+    font-size: 8pt;
+    background: transparent;
+}
+QPushButton#floatBtn {
+    background: rgba(255, 255, 255, 0.08);
+    color: #cfe8d4;
+    border: none;
+    border-radius: 8px;
+    font-family: "Segoe UI Symbol";
+    font-size: 9pt;
+    padding: 0;
+}
+QPushButton#floatBtn:hover { background-color: rgba(255, 115, 99, 0.85); color: #ffffff; }
+QComboBox#floatCombo {
+    background-color: rgba(255, 255, 255, 0.09);
+    color: #e8f5ea;
+    border: 1px solid rgba(126, 231, 135, 0.25);
+    border-radius: 8px;
+    padding: 2px 6px;
+    min-width: 56px;
+    font-size: 8pt;
+}
+QComboBox#floatCombo:hover { background-color: rgba(255, 255, 255, 0.15); }
+QComboBox#floatCombo::drop-down { border: none; width: 16px; }
+QComboBox#floatCombo::down-arrow {
+    width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #9fd8ac;
+    margin-right: 4px;
+}
+QTextEdit#floatBody {
+    background-color: transparent;
+    color: #eef7ef;
+    border: none;
+    font-size: 9pt;
+    selection-background-color: #2da44e;
+    selection-color: #ffffff;
+}
+
+/* ---- 自绘标题栏 (无边框窗口) ---- */
+QLabel#winTitle {
+    color: #527052;
+    font-size: 9pt;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+}
+QPushButton#winBtn {
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    color: #527052;
+    font-family: "Segoe UI Symbol";
+    font-size: 10pt;
+    padding: 0;
+}
+QPushButton#winBtn:hover { background-color: rgba(0, 0, 0, 0.07); }
+QPushButton#winBtn:pressed { background-color: rgba(0, 0, 0, 0.13); }
+QPushButton#winBtn#closeBtn:hover {
+    background-color: #ff5f57;
+    color: #ffffff;
+}
+QPushButton#winBtn#closeBtn:pressed { background-color: #e0443e; }
+
+/* Tooltip (Apple 深色胶囊) */
+QToolTip {
+    background-color: rgba(28, 44, 28, 0.92);
+    color: #f5fff5;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 9pt;
+}
+
+/* Dialog */
+QDialog { background-color: #f0f8f0; }
 """
+
+
+def _ensure_check_png():
+    """生成白色对勾 PNG（复选框选中态用），返回可供 QSS url() 使用的路径。
+    用 QImage 而非 QPixmap：模块导入时 QApplication 还不存在。"""
+    try:
+        path = os.path.join(tempfile.gettempdir(), f"vrcosc_check_{os.getpid()}.png")
+        if not os.path.exists(path):
+            from PyQt5.QtGui import QImage
+            img = QImage(12, 12, QImage.Format_ARGB32)
+            img.fill(0)
+            p = QPainter(img)
+            p.setRenderHint(QPainter.Antialiasing)
+            pen = QPen(QColor("#ffffff"), 2.2)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            p.setPen(pen)
+            p.drawPolyline([QPoint(2, 6), QPoint(5, 9), QPoint(10, 3)])
+            p.end()
+            if not img.save(path, "PNG"):
+                return None
+        return path.replace("\\", "/")
+    except Exception:
+        return None
+
+
+_CHECK_PNG = _ensure_check_png()
+if _CHECK_PNG:
+    STYLE_SHEET = _STYLE_SHEET_TEMPLATE.replace("__CHECK_URL__", _CHECK_PNG)
+else:
+    # 生成失败时退回纯色块选中态
+    STYLE_SHEET = _STYLE_SHEET_TEMPLATE.replace("    image: url(__CHECK_URL__);\n", "")
+
+
+# ============================================================
+# 动画基础设施
+# 原则 (emil-design-eng / animate / apple-design):
+# - 高频操作不加动画; UI 动画 < 300ms; 入场一律 ease-out
+# - 只做 opacity / 位置入场, 不做布局属性动画
+# - 尊重系统"减少动态效果"设置 (reduced motion = 更克制而非零动画)
+# ============================================================
+def _system_animations_enabled():
+    """Windows: 读取系统"在 Windows 中显示动画"设置，关闭时只保留极短淡入淡出。"""
+    if sys.platform != "win32":
+        return True
+    try:
+        val = ctypes.c_int(1)
+        SPI_GETCLIENTAREAANIMATION = 0x1042
+        ok = ctypes.windll.user32.SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION, 0, ctypes.byref(val), 0
+        )
+        return bool(ok) and bool(val.value)
+    except Exception:
+        return True
+
+
+MOTION_OK = _system_animations_enabled()
+# VRC_UI_SLOWMO=4 可将所有动画放慢 4 倍，便于慢速检查动画细节
+try:
+    MOTION_SCALE = max(0.1, float(os.environ.get("VRC_UI_SLOWMO", "1") or 1))
+except ValueError:
+    MOTION_SCALE = 1.0
+
+
+def _out_cubic():
+    return QEasingCurve(QEasingCurve.OutCubic)
+
+
+def fade_in(widget, duration=150, delay=0, finished=None):
+    """淡入一个控件；结束后移除透明度特效，恢复原生渲染。
+    若控件已有特效（被中断的淡出/淡入），从当前透明度续播，避免跳变。"""
+    dur = max(1, int(duration * MOTION_SCALE))
+    if not MOTION_OK:
+        dur = min(dur, 80)
+    effect = widget.graphicsEffect()
+    if isinstance(effect, QGraphicsOpacityEffect):
+        start_op = effect.opacity()
+    else:
+        effect = QGraphicsOpacityEffect(widget)
+        effect.setOpacity(0.0)
+        widget.setGraphicsEffect(effect)
+        start_op = 0.0
+    anim = QPropertyAnimation(effect, b"opacity", widget)
+    anim.setDuration(dur)
+    anim.setStartValue(start_op)
+    anim.setEndValue(1.0)
+    anim.setEasingCurve(_out_cubic())
+
+    def _cleanup():
+        # 被更新一次的淡入/淡出取代时，本轮回调作废（防止旧回调清掉新状态）
+        if getattr(widget, "_ui_fade", None) is not anim:
+            return
+        try:
+            if widget.graphicsEffect() is effect:
+                widget.setGraphicsEffect(None)
+        except RuntimeError:
+            return
+        if finished:
+            finished()
+
+    anim.finished.connect(_cleanup)
+    widget._ui_fade = anim
+    widget._ui_fade_dir = "in"
+    if delay > 0:
+        QTimer.singleShot(int(delay * MOTION_SCALE), anim.start)
+    else:
+        anim.start()
+    return anim
+
+
+def fade_out(widget, duration=100, finished=None):
+    """淡出一个控件；结束后移除特效并回调（调用方再改文字/状态）。"""
+    dur = max(1, int(duration * MOTION_SCALE))
+    if not MOTION_OK:
+        dur = min(dur, 60)
+    effect = widget.graphicsEffect()
+    if not isinstance(effect, QGraphicsOpacityEffect):
+        effect = QGraphicsOpacityEffect(widget)
+        effect.setOpacity(1.0)
+        widget.setGraphicsEffect(effect)
+    anim = QPropertyAnimation(effect, b"opacity", widget)
+    anim.setDuration(dur)
+    anim.setStartValue(effect.opacity())
+    anim.setEndValue(0.0)
+    anim.setEasingCurve(_out_cubic())
+
+    def _cleanup():
+        if getattr(widget, "_ui_fade", None) is not anim:
+            return
+        try:
+            if widget.graphicsEffect() is effect:
+                widget.setGraphicsEffect(None)
+        except RuntimeError:
+            pass
+        if finished:
+            finished()
+
+    anim.finished.connect(_cleanup)
+    widget._ui_fade = anim
+    widget._ui_fade_dir = "out"
+    anim.start()
+    return anim
+
+
+def is_fading_out(widget):
+    """控件是否正处于淡出动画中（用于快速状态翻转时重新淡入）。"""
+    return getattr(widget, "_ui_fade_dir", None) == "out" and \
+        getattr(widget, "_ui_fade", None) is not None
+
+
+def rise_fade_in(widget, duration=200, rise=12):
+    """顶层窗口/对话框入场：windowOpacity 淡入 + 自下方 rise 像素上浮。
+    顶层窗口用 windowOpacity（原生合成器路径），不用 QGraphicsOpacityEffect。"""
+    dur = max(1, int(duration * MOTION_SCALE))
+    if not MOTION_OK:
+        dur = min(dur, 80)
+        rise = 0
+
+    widget.setWindowOpacity(0.0)
+    opacity = QPropertyAnimation(widget, b"windowOpacity", widget)
+    opacity.setDuration(dur)
+    opacity.setStartValue(0.0)
+    opacity.setEndValue(1.0)
+    opacity.setEasingCurve(_out_cubic())
+
+    group = QParallelAnimationGroup(widget)
+    group.addAnimation(opacity)
+    if rise:
+        p = widget.pos()
+        widget.move(p.x(), p.y() + int(rise))
+        pos = QPropertyAnimation(widget, b"pos", widget)
+        pos.setDuration(dur)
+        pos.setEasingCurve(_out_cubic())
+        pos.setEndValue(p)
+        group.addAnimation(pos)
+
+    def _ensure_visible():
+        widget.setWindowOpacity(1.0)  # 兜底：任何情况下不能停在半透明
+
+    group.finished.connect(_ensure_visible)
+    widget._ui_rise = group
+    group.start()
+
+
+def stagger_fade(widgets, duration=240, step=50, delay=0):
+    """一组控件依次淡入（stagger 30-80ms），入场不位移，避免和布局打架。"""
+    if not MOTION_OK:
+        duration = 100
+        step = 20
+    for i, w in enumerate(widgets):
+        try:
+            fade_in(w, duration, delay=delay + i * step)
+        except RuntimeError:
+            continue
+
+
+def start_pulse(widget, period=1400, min_opacity=0.8):
+    """活动状态呼吸脉冲（录音中）。仅状态指示用途，停止时必须调用 stop_pulse。"""
+    if not MOTION_OK:
+        return
+    stop_pulse(widget)
+    effect = QGraphicsOpacityEffect(widget)
+    effect.setOpacity(1.0)
+    widget.setGraphicsEffect(effect)
+    anim = QPropertyAnimation(effect, b"opacity", widget)
+    anim.setDuration(int(period * MOTION_SCALE))
+    anim.setStartValue(1.0)
+    anim.setKeyValueAt(0.5, min_opacity)
+    anim.setEndValue(1.0)
+    anim.setEasingCurve(QEasingCurve(QEasingCurve.InOutSine))
+    anim.setLoopCount(-1)
+    anim.start()
+    widget._pulse_anim = anim
+    widget._pulse_effect = effect
+
+
+def stop_pulse(widget):
+    anim = getattr(widget, "_pulse_anim", None)
+    if anim is not None:
+        anim.stop()
+    widget._pulse_anim = None
+    widget._pulse_effect = None
+    try:
+        effect = widget.graphicsEffect()
+        if isinstance(effect, QGraphicsOpacityEffect):
+            widget.setGraphicsEffect(None)
+    except RuntimeError:
+        pass
+
+
+_FLASH_ANIMS = {}
+
+
+def flash_history_item(item, duration=500):
+    """新历史条目绿色高亮淡出（发送成功的反馈，偶发操作）。"""
+    if not MOTION_OK:
+        return
+    lw = item.listWidget()
+    if lw is None:
+        return
+
+    def _set_bg(alpha):
+        try:
+            c = QColor(52, 199, 89, int(alpha))
+            item.setBackground(QBrush(c))
+        except RuntimeError:
+            return
+
+    anim = QVariantAnimation(lw)
+    anim.setDuration(int(duration * MOTION_SCALE))
+    anim.setStartValue(70.0)
+    anim.setEndValue(0.0)
+    anim.setEasingCurve(_out_cubic())
+    anim.valueChanged.connect(_set_bg)
+
+    def _cleanup():
+        try:
+            item.setBackground(QBrush(Qt.transparent))
+        except RuntimeError:
+            pass
+        _FLASH_ANIMS.pop(id(item), None)
+
+    anim.finished.connect(_cleanup)
+    _FLASH_ANIMS[id(item)] = anim
+    anim.start()
+
+
+# ============================================================
+# 麦克风实时音量条 - 录音时显示输入电平，方便排查"识别不到我说话"
+# ============================================================
+class MicLevelBar(QWidget):
+    """细长电平条：绿色常态，橙色接近削波，红色削波；带峰值保持标记。
+
+    显示值用快攻慢放的追踪平滑（Apple 流体感）：上涨迅速跟手，
+    回落缓慢收尾，颜色在绿→橙→红之间连续插值而非跳变。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._level = 0.0    # 引擎真实电平（目标值）
+        self._disp = 0.0     # 显示电平（平滑追踪）
+        self._peak = 0.0
+        self._engine = None
+        self.setFixedHeight(10)
+        self.setMinimumWidth(60)
+        self._timer = QTimer(self)
+        self._timer.setInterval(33)  # ~30fps，追帧更顺滑
+        self._timer.timeout.connect(self._poll)
+
+    def start(self, engine):
+        self._engine = engine
+        self._level = 0.0
+        self._disp = 0.0
+        self._peak = 0.0
+        self.setVisible(True)
+        self._timer.start()
+
+    def stop(self):
+        self._timer.stop()
+        self._engine = None
+        self.setVisible(False)
+
+    def _poll(self):
+        raw = float(getattr(self._engine, "_level", 0.0) or 0.0)
+        self._level = raw
+        # 快攻慢放：上涨 45%/帧 跟手，回落 16%/帧 柔和收尾
+        rise = 0.45 if raw > self._disp else 0.16
+        self._disp += (raw - self._disp) * rise
+        if abs(raw - self._disp) < 0.002:
+            self._disp = raw
+        # 峰值保持缓慢下落
+        self._peak = max(self._peak - 0.006, self._disp)
+        self.update()
+
+    @staticmethod
+    def _level_color(lvl):
+        """绿(≤0.6) → 橙(0.8) → 红(≥0.95) 连续插值。"""
+        green = QColor("#2da44e")
+        orange = QColor("#ff9500")
+        red = QColor("#ff3b30")
+        if lvl <= 0.6:
+            return green
+        if lvl >= 0.95:
+            return red
+        if lvl <= 0.8:
+            t = (lvl - 0.6) / 0.2
+            return QColor(
+                round(green.red() + (orange.red() - green.red()) * t),
+                round(green.green() + (orange.green() - green.green()) * t),
+                round(green.blue() + (orange.blue() - green.blue()) * t),
+            )
+        t = (lvl - 0.8) / 0.15
+        return QColor(
+            round(orange.red() + (red.red() - orange.red()) * t),
+            round(orange.green() + (red.green() - orange.green()) * t),
+            round(orange.blue() + (red.blue() - orange.blue()) * t),
+        )
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = float(self.width()), float(self.height())
+        r = h / 2.0
+        p.setPen(Qt.NoPen)
+        # 底槽
+        p.setBrush(QColor(52, 199, 89, 36))
+        p.drawRoundedRect(QRectF(0, 0, w, h), r, r)
+        # 电平填充（平滑追踪值）
+        lw = w * max(0.0, min(1.0, self._disp))
+        if lw > 0.5:
+            p.setBrush(self._level_color(self._disp))
+            p.drawRoundedRect(QRectF(0, 0, max(lw, h), h), r, r)
+        # 峰值标记
+        px = w * min(1.0, self._peak)
+        if px > 2:
+            p.setBrush(QColor(26, 58, 26, 110))
+            p.drawRoundedRect(QRectF(px - 1, 1.5, 2, h - 3), 1, 1)
+
+
+# ============================================================
+# 自绘标题栏 - 无边框窗口的拖拽/双击最大化 + 最小化/最大化/关闭按钮
+# ============================================================
+class TitleBar(QWidget):
+    def __init__(self, main_window):
+        super().__init__(main_window)
+        self._win = main_window
+        self._drag_offset = None
+        self.setFixedHeight(42)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(16, 5, 8, 5)
+        lay.setSpacing(8)
+
+        icon_label = QLabel()
+        icon_path = os.path.join(RES_DIR, "app_icon.ico")
+        if not os.path.exists(icon_path):
+            icon_path = os.path.join(APP_DIR, "app_icon.ico")
+        if os.path.exists(icon_path):
+            icon_label.setPixmap(QIcon(icon_path).pixmap(18, 18))
+        icon_label.setFixedSize(18, 18)
+        lay.addWidget(icon_label)
+
+        title = QLabel(f"{APP_TITLE}  v{APP_VERSION}")
+        title.setObjectName("winTitle")
+        lay.addWidget(title)
+        lay.addStretch()
+
+        self.min_btn = QPushButton("\u2014")   # —
+        self.max_btn = QPushButton("\u25A1")   # □
+        self.close_btn = QPushButton("\u2715")  # ✕
+        for b in (self.min_btn, self.max_btn, self.close_btn):
+            b.setObjectName("winBtn")
+            b.setFixedSize(34, 26)
+            b.setCursor(Qt.PointingHandCursor)
+            lay.addWidget(b)
+        self.close_btn.setObjectName("closeBtn")
+        self.max_btn.setToolTip("最大化 / 还原（双击标题栏同效）")
+        self.min_btn.setToolTip("最小化")
+        self.close_btn.setToolTip("关闭")
+        self.min_btn.clicked.connect(self._win.showMinimized)
+        self.max_btn.clicked.connect(self._win.toggle_maximize)
+        self.close_btn.clicked.connect(self._win.close)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and not getattr(self._win, "_maxed", False):
+            self._drag_offset = event.globalPos() - self._win.frameGeometry().topLeft()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
+            self._win.move(event.globalPos() - self._drag_offset)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self._win.toggle_maximize()
+        super().mouseDoubleClickEvent(event)
+
+
+# ============================================================
+# 无边框窗口边缘缩放 - 应用级事件过滤器，命中窗口边缘 5px 时启用手势
+# ============================================================
+class FramelessResizer(QObject):
+    L, R, T, B = 1, 2, 4, 8
+    MARGIN = 5
+
+    def __init__(self, win):
+        super().__init__(win)
+        self._win = win
+        self._edges = 0
+        self._press = None
+        self._geo0 = None
+        QApplication.instance().installEventFilter(self)
+
+    def _edge_at(self, gp, fg):
+        m = self.MARGIN
+        e = 0
+        if gp.x() <= fg.left() + m:
+            e |= self.L
+        if gp.x() >= fg.right() - m:
+            e |= self.R
+        if gp.y() <= fg.top() + m:
+            e |= self.T
+        if gp.y() >= fg.bottom() - m:
+            e |= self.B
+        return e
+
+    def _update_cursor(self, e):
+        win = self._win
+        if e == 0:
+            win.unsetCursor()
+        elif e in (self.T, self.B):
+            win.setCursor(Qt.SizeVerCursor)
+        elif e in (self.L, self.R):
+            win.setCursor(Qt.SizeHorCursor)
+        elif e in (self.L | self.T, self.R | self.B):
+            win.setCursor(Qt.SizeFDiagCursor)
+        else:
+            win.setCursor(Qt.SizeBDiagCursor)
+
+    def _do_resize(self, gp):
+        win = self._win
+        e = self._edges
+        g = QRect(self._geo0)
+        d = gp - self._press
+        minw, minh = win.minimumWidth(), win.minimumHeight()
+        if e & self.L:
+            g.setX(min(g.x() + d.x(), g.right() - minw + 1))
+        if e & self.R:
+            g.setWidth(max(minw, g.width() + d.x()))
+        if e & self.T:
+            g.setY(min(g.y() + d.y(), g.bottom() - minh + 1))
+        if e & self.B:
+            g.setHeight(max(minh, g.height() + d.y()))
+        win.setGeometry(g)
+
+    def eventFilter(self, obj, ev):
+        # 应用级过滤器会收到所有 QObject 的事件；非控件对象没有 window()，
+        # 对它们调用会抛 AttributeError，PyQt5 会 qFatal 直接杀进程
+        if not isinstance(obj, QWidget):
+            return False
+        win = self._win
+        try:
+            if obj.window() is not win or getattr(win, "_maxed", False):
+                return False
+        except RuntimeError:
+            return False
+        t = ev.type()
+        if t not in (QEvent.MouseMove, QEvent.MouseButtonPress,
+                     QEvent.MouseButtonRelease, QEvent.Leave):
+            return False
+        # 滚动条贴着窗口右缘，不能吞掉它的点击
+        if isinstance(obj, QScrollBar):
+            return False
+        gp = QCursor.pos()
+        fg = win.frameGeometry()
+        if t == QEvent.MouseButtonPress and ev.button() == Qt.LeftButton:
+            e = self._edge_at(gp, fg)
+            if e:
+                self._edges = e
+                self._press = gp
+                self._geo0 = QRect(fg)
+                return True
+        elif t == QEvent.MouseMove:
+            if self._press:
+                self._do_resize(gp)
+                return True
+            self._update_cursor(self._edge_at(gp, fg))
+        elif t == QEvent.MouseButtonRelease and self._press:
+            self._press = None
+            self._edges = 0
+            win.unsetCursor()
+        elif t == QEvent.Leave and not self._press:
+            win.unsetCursor()
+        return False
+
+
+# ============================================================
+# 扬声器悬浮翻译引擎 - 捕获扬声器回环音频 → 能量切段 → 识别 → 翻译
+# 与麦克风 VoiceEngine 完全独立（各自的模型实例和线程），可同时运行
+# ============================================================
+class SpeakerEngine(QObject):
+    partialResult = pyqtSignal(str)      # 识别到的原文
+    translated = pyqtSignal(str, str)    # (原文, 译文；译文失败时为空串)
+    status = pyqtSignal(str)
+    error = pyqtSignal(str)
+    finishedSig = pyqtSignal()
+
+    def __init__(self, translator):
+        super().__init__()
+        self._translator = translator
+        self._recognizer = None
+        self._segmenter = None
+        self._running = False
+        self._gen = 0  # 代际计数：热切换输出设备时作废旧工作线程
+        self._device_index = None
+        self._lang = "auto"
+        self._target = "zh"
+        self._level = 0.0  # 归一化捕获电平 (0..1)，悬浮窗音量条轮询用
+        self._tq = queue.Queue(maxsize=8)
+        self._tr_running = False
+
+    def set_langs(self, lang, target):
+        """实时切换源语言/目标语言（识别器语言在下次加载模型时生效）。"""
+        self._lang = lang or "auto"
+        self._target = target or "zh"
+
+    def start(self, device_index, lang, target):
+        """device_index: pyaudiowpatch 回环设备索引；None = 默认输出的回环。"""
+        self._gen += 1
+        my_gen = self._gen
+        self._device_index = device_index
+        self.set_langs(lang, target)
+        self._level = 0.0
+        self._running = True
+        self._tr_running = True
+        threading.Thread(target=self._worker, args=(my_gen,), daemon=True).start()
+        threading.Thread(target=self._translator_worker, daemon=True).start()
+
+    def stop(self):
+        self._gen += 1
+        self._running = False
+        self._tr_running = False
+
+    def _ensure_models(self):
+        if self._recognizer is not None:
+            return
+        if not os.path.exists(ASR_MODEL):
+            raise FileNotFoundError(f"找不到语音识别模型: {ASR_MODEL}")
+        self.status.emit("正在加载翻译模型...")
+        self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=ASR_MODEL,
+            tokens=ASR_TOKENS,
+            num_threads=2,
+            use_itn=True,
+            language=self._lang,
+        )
+        # sherpa 1.13.x Silero VAD 出段损坏，改用能量分段器（参数对扬声器更严格）
+        self._segmenter = _EnergySegmenter(
+            sr=SAMPLE_RATE, gain=1.4, min_speech=0.3, min_silence=0.7, max_speech=10.0
+        )
+
+    def _worker(self, my_gen):
+        try:
+            if not _HAS_SPEAKER_LIB:
+                raise RuntimeError("缺少 pyaudiowpatch 库，请重新安装本程序")
+            self._ensure_models()
+            p = pyaudio_wp.PyAudio()
+            try:
+                if self._device_index is not None:
+                    loop = p.get_device_info_by_index(self._device_index)
+                else:
+                    wasapi = p.get_host_api_info_by_type(pyaudio_wp.paWASAPI)
+                    out = p.get_device_info_by_index(wasapi["defaultOutputDevice"])
+                    loop = out if out.get("isLoopbackDevice") else None
+                    if loop is None:
+                        for lb in p.get_loopback_device_info_generator():
+                            if out["name"] in lb["name"]:
+                                loop = lb
+                                break
+                if loop is None:
+                    raise RuntimeError("找不到扬声器的回环设备")
+                rate = int(loop["defaultSampleRate"])
+                ch = loop["maxInputChannels"]
+                if self._gen != my_gen:
+                    return  # 已被热切换/停止作废
+                self.status.emit(f"正在捕获: {loop['name'].replace(' [Loopback]', '')}")
+                stream = p.open(
+                    format=pyaudio_wp.paInt16,
+                    channels=ch,
+                    rate=rate,
+                    frames_per_buffer=int(rate * 0.1),
+                    input=True,
+                    input_device_index=loop["index"],
+                )
+                try:
+                    while self._running and self._gen == my_gen:
+                        data = stream.read(int(rate * 0.1), exception_on_overflow=False)
+                        x = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                        if ch > 1:
+                            x = x.reshape(-1, ch).mean(axis=1)
+                        mono = _resample_linear(x, rate, SAMPLE_RATE)
+                        # 归一化电平（-45dB..0dB 映射），供悬浮窗音量条
+                        rms = float(np.sqrt(np.mean(mono * mono))) if len(mono) else 0.0
+                        db = 20.0 * math.log10(rms + 1e-7)
+                        norm = max(0.0, min(1.0, (db + 45.0) / 45.0))
+                        prev = self._level
+                        self._level = norm if norm >= prev else prev * 0.85 + norm * 0.15
+                        if self._segmenter is None:
+                            break
+                        self._segmenter.accept(mono)
+                        for seg in self._segmenter.pop_segments():
+                            self._recognize(seg)
+                finally:
+                    try:
+                        stream.stop_stream()
+                        stream.close()
+                    except Exception:
+                        pass
+                # 收尾：把未闭合的段冲出来识别
+                if self._segmenter is not None and self._gen == my_gen:
+                    self._segmenter.flush()
+                    for seg in self._segmenter.pop_segments():
+                        self._recognize(seg)
+            finally:
+                p.terminate()
+        except Exception as e:
+            if self._gen == my_gen:
+                self.error.emit(f"扬声器捕获失败: {e}")
+        finally:
+            if self._gen == my_gen:
+                self._running = False
+                self.finishedSig.emit()
+
+    def _recognize(self, samples):
+        try:
+            stream = self._recognizer.create_stream()
+            stream.accept_waveform(SAMPLE_RATE, samples)
+            self._recognizer.decode_stream(stream)
+            text = stream.result.text.strip()
+            if not _has_real_text(text):
+                self.status.emit("（这段没识别到清晰语音）")
+                return
+            self.partialResult.emit(text)
+            try:
+                self._tq.put_nowait(text)
+            except queue.Full:
+                pass  # 翻译跟不上时丢弃新段，避免延迟滚雪球
+        except Exception:
+            pass
+
+    def _translator_worker(self):
+        while self._tr_running:
+            try:
+                text = self._tq.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            translated = ""
+            # 免费接口偶发限流/超时，失败最多重试 2 次（退避递增）
+            for attempt in range(3):
+                try:
+                    translated, err = self._translator.translate(
+                        text, voice_lang_to_baidu(self._lang), self._target
+                    )
+                    if err:
+                        translated = ""
+                except Exception:
+                    translated = ""
+                if translated or not self._tr_running:
+                    break
+                self.status.emit(f"翻译接口暂时失败，正在重试({attempt + 1}/2)...")
+                time.sleep(1.2 * (attempt + 1))
+            if not self._tr_running:
+                break
+            self.translated.emit(text, translated)
+
+
+# ============================================================
+# 悬浮翻译窗 - 深色玻璃、置顶、可拖动，实时显示 原文→译文
+# ============================================================
+class FloatingTranslateWindow(QWidget):
+    closedByUser = pyqtSignal()  # 用户点 ✕：主窗口应停止引擎并复位按钮
+
+    def __init__(self):
+        super().__init__(
+            None, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(400, 320)
+        self._drag_offset = None
+        self._pending_original = None
+
+        card = QFrame(self)
+        card.setObjectName("floatCard")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(14, 10, 14, 12)
+        lay.setSpacing(6)
+
+        # ---- 头部：标题 + 语言选择 + 关闭 ----
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        dot = QLabel("🌐")
+        title = QLabel("悬浮翻译")
+        title.setObjectName("floatTitle")
+        head.addWidget(dot)
+        head.addWidget(title)
+        head.addStretch()
+
+        self.source_combo = QComboBox()
+        self.source_combo.setObjectName("floatCombo")
+        for label, code in LANGUAGES:
+            self.source_combo.addItem(label, code)
+        self.source_combo.setToolTip("扬声器里的语音语言")
+        head.addWidget(self.source_combo)
+
+        arrow = QLabel("→")
+        arrow.setObjectName("floatTitle")
+        head.addWidget(arrow)
+
+        self.target_combo = QComboBox()
+        self.target_combo.setObjectName("floatCombo")
+        # 翻译方向固定为 其他语言 → 中文，中文排在首位作为默认
+        for label, code in [("中文", "zh")] + TRANSLATE_LANGS:
+            self.target_combo.addItem(label, code)
+        self.target_combo.setToolTip("翻译目标语言")
+        head.addWidget(self.target_combo)
+
+        self.close_btn = QPushButton("\u2715")
+        self.close_btn.setObjectName("floatBtn")
+        self.close_btn.setFixedSize(24, 24)
+        self.close_btn.setCursor(Qt.PointingHandCursor)
+        self.close_btn.setToolTip("关闭悬浮窗")
+        head.addWidget(self.close_btn)
+        lay.addLayout(head)
+
+        # ---- 输出设备选择行（游戏/音乐可能不走默认输出设备）----
+        dev_row = QHBoxLayout()
+        dev_row.setSpacing(6)
+        dev_label = QLabel("捕获:")
+        dev_label.setObjectName("floatStatus")
+        dev_row.addWidget(dev_label)
+        self.device_combo = QComboBox()
+        self.device_combo.setObjectName("floatCombo")
+        self.device_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.device_combo.setToolTip("选择要捕获哪个扬声器/输出设备的音频")
+        dev_row.addWidget(self.device_combo, 1)
+        lay.addLayout(dev_row)
+
+        # ---- 捕获电平条：条子没动说明选错了设备或没有声音 ----
+        self.level_bar = MicLevelBar()
+        self.level_bar.setVisible(False)
+        lay.addWidget(self.level_bar)
+
+        # ---- 状态行（识别中提示/错误）----
+        self.status_label = QLabel("等待启动...")
+        self.status_label.setObjectName("floatStatus")
+        self.status_label.setWordWrap(True)
+        lay.addWidget(self.status_label)
+
+        # ---- 正文：原文→译文 流 ----
+        self.body = QTextEdit()
+        self.body.setObjectName("floatBody")
+        self.body.setReadOnly(True)
+        lay.addWidget(self.body, 1)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(card)
+
+        self.close_btn.clicked.connect(self._on_user_close)
+
+    # ---- 对外接口 ----
+    def set_langs(self, source, target):
+        for combo, code in ((self.source_combo, source), (self.target_combo, target)):
+            if code is None:
+                continue
+            for i in range(combo.count()):
+                if combo.itemData(i) == code:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(i)
+                    combo.blockSignals(False)
+                    break
+
+    def source_lang(self):
+        return self.source_combo.currentData() or "auto"
+
+    def target_lang(self):
+        return self.target_combo.currentData() or "zh"
+
+    def set_devices(self, devices, selected_index=None):
+        """填充输出设备下拉框。devices: [(显示名, 设备索引)]。"""
+        self.device_combo.blockSignals(True)
+        self.device_combo.clear()
+        for label, idx in devices:
+            self.device_combo.addItem(label, idx)
+        if selected_index is not None:
+            for i in range(self.device_combo.count()):
+                if self.device_combo.itemData(i) == selected_index:
+                    self.device_combo.setCurrentIndex(i)
+                    break
+        self.device_combo.blockSignals(False)
+
+    def current_device_index(self):
+        return self.device_combo.currentData()
+
+    def current_device_name(self):
+        return self.device_combo.currentText()
+
+    def start_meter(self, engine):
+        """显示捕获电平条并开始轮询引擎电平。"""
+        self.level_bar.start(engine)
+
+    def stop_meter(self):
+        self.level_bar.stop()
+        self.level_bar.setVisible(False)
+
+    def show_at(self, geo):
+        if geo and len(geo) == 4:
+            x, y, w, h = geo
+            if w == self.width() and h == self.height():
+                self.move(x, y)
+        self.show()
+        self.raise_()
+        self._play_entrance()
+
+    def _play_entrance(self):
+        """Apple 式入场：淡入 + 从 92% 放大到位 + 8px 上浮（绝不从 0 开始）。"""
+        if not MOTION_OK:
+            self.setWindowOpacity(1.0)
+            return
+        final = self.geometry()
+        w, h = final.width(), final.height()
+        start = QRect(
+            final.x() + int(w * 0.04), final.y() + 8 + int(h * 0.04),
+            int(w * 0.92), int(h * 0.92),
+        )
+        self.setWindowOpacity(0.0)
+        group = QParallelAnimationGroup(self)
+        geo_anim = QPropertyAnimation(self, b"geometry", self)
+        geo_anim.setDuration(int(240 * MOTION_SCALE))
+        geo_anim.setStartValue(start)
+        geo_anim.setEndValue(QRect(final))
+        geo_anim.setEasingCurve(_out_cubic())
+        op_anim = QPropertyAnimation(self, b"windowOpacity", self)
+        op_anim.setDuration(int(200 * MOTION_SCALE))
+        op_anim.setStartValue(0.0)
+        op_anim.setEndValue(1.0)
+        op_anim.setEasingCurve(_out_cubic())
+        group.addAnimation(geo_anim)
+        group.addAnimation(op_anim)
+
+        def _done():
+            self.setWindowOpacity(1.0)  # 兜底：任何情况不停在半透明
+
+        group.finished.connect(_done)
+        self._entrance_anim = group
+        group.start()
+
+    def fade_hide(self):
+        """退场：150ms 淡出（比入场快），结束后真正隐藏。"""
+        if not self.isVisible():
+            return
+        if not MOTION_OK:
+            self.hide()
+            return
+        anim = QPropertyAnimation(self, b"windowOpacity", self)
+        anim.setDuration(int(150 * MOTION_SCALE))
+        anim.setStartValue(self.windowOpacity())
+        anim.setEndValue(0.0)
+        anim.setEasingCurve(_out_cubic())
+
+        def _done():
+            self.hide()
+            self.setWindowOpacity(1.0)
+
+        anim.finished.connect(_done)
+        self._fade_anim = anim
+        anim.start()
+
+    def clear_stream(self):
+        self.body.clear()
+        self._pending_original = None
+
+    def add_pending(self, text):
+        """识别到原文、翻译还没回来时先提示。"""
+        self._pending_original = text
+        self.status_label.setText(f"🔊 {text}（翻译中…）")
+
+    def add_pair(self, original, translated):
+        stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        esc = (original or "").replace("&", "&amp;").replace("<", "&lt;")
+        if translated:
+            tesc = translated.replace("&", "&amp;").replace("<", "&lt;")
+            block = (
+                f'<span style="color:#7fa387;font-size:8pt;">{stamp}</span><br>'
+                f'<span style="color:#eef7ef;">{esc}</span><br>'
+                f'<span style="color:#7ee787;">{tesc}</span>'
+            )
+        else:
+            block = (
+                f'<span style="color:#7fa387;font-size:8pt;">{stamp}</span><br>'
+                f'<span style="color:#eef7ef;">{esc}</span><br>'
+                f'<span style="color:#ffb46b;">（翻译失败，仅显示原文）</span>'
+            )
+        self.body.append(block)
+        self.body.append("<span style=\"color:#3a4a3c;\">—</span>")
+        self._pending_original = None
+        self.status_label.setText("正在监听扬声器...")
+        sb = self.body.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def set_float_status(self, text):
+        self.status_label.setText(text)
+
+    def save_geo(self):
+        g = self.geometry()
+        return [g.x(), g.y(), g.width(), g.height()]
+
+    def _on_user_close(self):
+        """用户点 ✕ = 完全停止：先淡出，再通知主窗口停引擎、复位按钮。"""
+        self.fade_hide()
+        self.closedByUser.emit()
+
+    # ---- 拖动 ----
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_offset = event.globalPos() - self.frameGeometry().topLeft()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPos() - self._drag_offset)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+
+
+# ============================================================
+# 历史列表换行代理 - 长条目自动换行，不再被硬裁剪
+# ============================================================
+class HistoryListDelegate(QStyledItemDelegate):
+    """历史条目按列表宽度自动换行（最多 max_lines 行），完整内容走 tooltip。"""
+
+    def __init__(self, view, max_lines=4):
+        super().__init__(view)
+        self._view = view
+        self._max_lines = max_lines
+
+    def sizeHint(self, option, index):
+        text = index.data(Qt.DisplayRole) or ""
+        fm = option.fontMetrics
+        vw = max(60, self._view.viewport().width() - 22)
+        rect = fm.boundingRect(0, 0, vw, 10000, Qt.TextWordWrap, text)
+        line_h = fm.height()
+        lines = max(1, round(rect.height() / line_h))
+        h = min(lines, self._max_lines) * line_h
+        return QSize(vw + 12, h + 10)
 
 
 # ============================================================
 # 淡绿色极光背景 - 直接在主窗口 paintEvent 绘制
 # ============================================================
 def paint_aurora_background(widget, event):
-    """在主窗口背景上绘制薄荷玻璃风弥散光球。"""
+    """在主窗口背景上绘制淡绿色弥散光球。"""
     painter = QPainter(widget)
     painter.setRenderHint(QPainter.Antialiasing)
 
@@ -475,34 +1586,32 @@ def paint_aurora_background(widget, event):
     if w == 0 or h == 0:
         return
 
-    # 底色: 薄荷白
-    painter.fillRect(event.rect(), QColor(238, 250, 247))
+    # 底色: 淡绿白
+    painter.fillRect(event.rect(), QColor(240, 248, 240))
 
-    def orb(cx, cy, rx, ry, color_inner, color_mid):
-        """绘制一枚弥散光球。"""
-        g = QRadialGradient(cx, cy, max(rx, ry))
-        g.setColorAt(0, color_inner)
-        g.setColorAt(0.5, color_mid)
-        g.setColorAt(1, QColor(color_mid.red(), color_mid.green(), color_mid.blue(), 0))
-        painter.setBrush(QBrush(g))
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(QPointF(cx, cy), rx, ry)
+    # 光球 1: 淡绿 - 左上
+    c1 = QRadialGradient(w * 0.15, h * 0.15, max(w, h) * 0.5)
+    c1.setColorAt(0, QColor(120, 200, 130, 80))
+    c1.setColorAt(0.5, QColor(120, 200, 130, 30))
+    c1.setColorAt(1, QColor(120, 200, 130, 0))
+    painter.setBrush(QBrush(c1))
+    painter.setPen(Qt.NoPen)
+    painter.drawEllipse(QPointF(w * 0.15, h * 0.15), w * 0.55, h * 0.55)
 
-    # 光球 1: 薄荷绿 - 左上
-    orb(w * 0.12, h * 0.10, w * 0.55, h * 0.55,
-        QColor(64, 224, 180, 90), QColor(64, 224, 180, 30))
-    # 光球 2: 青碧 - 右下
-    orb(w * 0.88, h * 0.85, w * 0.50, h * 0.50,
-        QColor(45, 200, 220, 70), QColor(45, 200, 220, 22))
-    # 光球 3: 樱粉 - 右上 (二次元点缀)
-    orb(w * 0.85, h * 0.12, w * 0.38, h * 0.38,
-        QColor(255, 170, 200, 55), QColor(255, 170, 200, 18))
-    # 光球 4: 淡青 - 中部
-    orb(w * 0.45, h * 0.55, w * 0.35, h * 0.35,
-        QColor(120, 230, 210, 40), QColor(120, 230, 210, 12))
-    # 光球 5: 淡黄绿 - 左下
-    orb(w * 0.15, h * 0.88, w * 0.30, h * 0.30,
-        QColor(190, 235, 130, 45), QColor(190, 235, 130, 14))
+    # 光球 2: 淡青绿 - 右下
+    c2 = QRadialGradient(w * 0.85, h * 0.8, max(w, h) * 0.5)
+    c2.setColorAt(0, QColor(100, 220, 180, 60))
+    c2.setColorAt(0.5, QColor(100, 220, 180, 20))
+    c2.setColorAt(1, QColor(100, 220, 180, 0))
+    painter.setBrush(QBrush(c2))
+    painter.drawEllipse(QPointF(w * 0.85, h * 0.8), w * 0.5, h * 0.5)
+
+    # 光球 3: 淡黄绿 - 中上
+    c3 = QRadialGradient(w * 0.6, h * 0.3, max(w, h) * 0.35)
+    c3.setColorAt(0, QColor(180, 220, 100, 40))
+    c3.setColorAt(1, QColor(180, 220, 100, 0))
+    painter.setBrush(QBrush(c3))
+    painter.drawEllipse(QPointF(w * 0.6, h * 0.3), w * 0.35, h * 0.35)
 
 
 class OSCSender:
@@ -573,6 +1682,223 @@ _MYMEMORY_LANG_MAP = {
     "it": "it", "pt": "pt", "th": "th", "vie": "vi", "ara": "ar",
 }
 
+# pyaudiowpatch 为可选依赖（扬声器回环捕获用），未安装时功能入口给出提示
+try:
+    import pyaudiowpatch as pyaudio_wp
+    _HAS_SPEAKER_LIB = True
+except Exception:
+    pyaudio_wp = None
+    _HAS_SPEAKER_LIB = False
+
+
+def _has_real_text(text):
+    """剔除空白、标点、符号后是否还有实际文字。
+
+    识别结果有时只剩 "。" 或单个感叹号——这类结果直接按未识别处理，
+    不发送、不翻译、不进历史。
+    """
+    if not text:
+        return False
+    return bool(re.sub(r"[\W_]+", "", text, flags=re.UNICODE))
+
+
+def voice_lang_to_baidu(lang_code):
+    """将语音识别语言代码映射为百度翻译语言代码。"""
+    mapping = {
+        "zh": "zh", "en": "en", "ja": "jp",
+        "ko": "kor", "yue": "yue", "auto": "auto",
+    }
+    return mapping.get(lang_code, "auto")
+
+
+def _detect_lang_simple(text):
+    """粗粒度语种检测（Unicode 区段），供不支持 auto 的翻译接口兜底。"""
+    for ch in text:
+        o = ord(ch)
+        if 0x0E00 <= o <= 0x0E7F:
+            return "th"
+        if 0x0600 <= o <= 0x06FF:
+            return "ar"
+        if 0x0400 <= o <= 0x04FF:
+            return "ru"
+        if 0xAC00 <= o <= 0xD7AF or 0x1100 <= o <= 0x11FF:
+            return "ko"
+        if 0x3040 <= o <= 0x30FF:
+            return "ja"
+        if 0x4E00 <= o <= 0x9FFF:
+            return "zh"
+    return "en"
+
+
+def _resample_linear(x, sr_in, sr_out):
+    """线性插值重采样（回环捕获 48k -> 识别 16k 用，无 scipy 依赖）。"""
+    if sr_in == sr_out:
+        return x.astype(np.float32)
+    n_out = int(len(x) * sr_out / sr_in)
+    if n_out <= 0 or len(x) == 0:
+        return np.zeros(0, dtype=np.float32)
+    return np.interp(
+        np.linspace(0.0, len(x) - 1.0, n_out),
+        np.arange(len(x), dtype=np.float64),
+        x,
+    ).astype(np.float32)
+
+
+class _EnergySegmenter:
+    """语音分段器（WebRTC VAD 帧判定，能量门限兜底）。
+
+    sherpa-onnx 1.13.x 的 Silero VAD 在部分环境出段损坏（只产出 0 采样空段）。
+    首选 WebRTC VAD（频谱特征判定，比纯能量抗噪得多）；webrtcvad 不可用时
+    退回自适应噪声底能量门限。
+    """
+
+    def __init__(self, sr=16000, gain=1.4, min_speech=0.25,
+                 min_silence=0.6, max_speech=10.0, preroll=0.7):
+        self.sr = sr
+        self.gain = gain
+        self.min_speech = min_speech
+        self.min_silence = min_silence
+        self.max_speech = max_speech
+        self.in_speech = False  # 供 UI 说话状态显示
+        self.segments = []
+        self._speech_run = 0.0
+        self._sil_run = 0.0
+        self._in_speech = False
+        self._seg_buf = []
+        self._preroll_buf = []
+
+        # ---- WebRTC VAD（首选）----
+        self._webrtc = None
+        try:
+            import webrtcvad
+            self._webrtc = webrtcvad.Vad(2)  # 0-3，2=均衡
+            self._frame_samples = int(sr * 0.03)  # 30ms 帧
+            self._frame_bytes_len = self._frame_samples * 2  # int16
+            self._frame_acc = b""
+            self._preroll_n = max(1, int(preroll / 0.03))
+            return
+        except Exception:
+            pass
+
+        # ---- 能量门限兜底 ----
+        self._preroll = int(preroll * sr / 512) or 1
+        self._hist = deque(maxlen=250)
+        self._smooth = None
+        self._buf = []
+
+    def accept(self, x):
+        if self._webrtc is not None:
+            pcm = (np.clip(x, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+            self._frame_acc += pcm
+            flen = self._frame_bytes_len
+            while len(self._frame_acc) >= flen:
+                frame = self._frame_acc[:flen]
+                self._frame_acc = self._frame_acc[flen:]
+                self._process_webrtc_frame(frame)
+            return
+        self._accept_energy(x)
+
+    def _process_webrtc_frame(self, frame_bytes):
+        dur = self._frame_samples / self.sr
+        try:
+            is_speech = self._webrtc.is_speech(frame_bytes, self.sr)
+        except Exception:
+            is_speech = False
+        arr = np.frombuffer(frame_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        if not self._in_speech:
+            self._preroll_buf.append(arr)
+            if len(self._preroll_buf) > self._preroll_n:
+                del self._preroll_buf[:-self._preroll_n]
+            if is_speech:
+                self._speech_run += dur
+                if self._speech_run >= self.min_speech:
+                    self._in_speech = True
+                    self.in_speech = True
+                    self._sil_run = 0.0
+                    self._seg_buf = list(self._preroll_buf)
+                    self._preroll_buf.clear()
+            else:
+                self._speech_run = max(0.0, self._speech_run - 1.2 * dur)
+        else:
+            self._seg_buf.append(arr)
+            if is_speech:
+                self._sil_run = 0.0
+            else:
+                self._sil_run += dur
+            total = sum(len(a) for a in self._seg_buf) / self.sr
+            if self._sil_run >= self.min_silence or total >= self.max_speech:
+                seg = np.concatenate(self._seg_buf)
+                if self._sil_run >= self.min_silence and self._sil_run * self.sr < len(seg):
+                    seg = seg[:len(seg) - int(self._sil_run * self.sr)]
+                if len(seg) >= self.min_speech * self.sr:
+                    self.segments.append(seg.astype(np.float32))
+                self._seg_buf = []
+                self._in_speech = False
+                self.in_speech = False
+                self._speech_run = 0.0
+                self._sil_run = 0.0
+
+    def _accept_energy(self, x):
+        """能量门限兜底路径（webrtcvad 不可用时）。"""
+        rms = float(np.sqrt(np.mean(x * x))) if len(x) else 0.0
+        self._smooth = rms if self._smooth is None else 0.6 * self._smooth + 0.4 * rms
+        lvl = self._smooth
+        if not self._in_speech:
+            self._hist.append(lvl)
+        self._noise = max(min(self._hist), 0.003)
+        thr = self._noise * self.gain
+        dur = len(x) / self.sr
+        if not self._in_speech:
+            self._buf.append(x)
+            if len(self._buf) > self._preroll:
+                del self._buf[:-self._preroll]
+            if lvl > thr:
+                self._speech_run += dur
+                if self._speech_run >= self.min_speech:
+                    self._in_speech = True
+                    self.in_speech = True
+                    self._sil_run = 0.0
+            else:
+                self._speech_run = max(0.0, self._speech_run - 1.2 * dur)
+        else:
+            self._buf.append(x)
+            if lvl > thr:
+                self._sil_run = 0.0
+            else:
+                self._sil_run += dur
+            total = sum(len(a) for a in self._buf) / self.sr
+            if self._sil_run >= self.min_silence or total >= self.max_speech:
+                seg = np.concatenate(self._buf)
+                if self._sil_run >= self.min_silence and self._sil_run * self.sr < len(seg):
+                    seg = seg[:len(seg) - int(self._sil_run * self.sr)]
+                if len(seg) >= self.min_speech * self.sr:
+                    self.segments.append(seg.astype(np.float32))
+                self._buf = []
+                self._in_speech = False
+                self.in_speech = False
+                self._speech_run = 0.0
+                self._sil_run = 0.0
+
+    def pop_segments(self):
+        out, self.segments = self.segments, []
+        return out
+
+    def flush(self):
+        """强制闭合当前未完成的段（停止/测试收尾时用）。"""
+        buf = self._seg_buf if self._webrtc is not None else self._buf
+        if buf:
+            seg = np.concatenate(buf)
+            if len(seg) >= self.min_speech * self.sr:
+                self.segments.append(seg.astype(np.float32))
+        self._seg_buf = []
+        self._buf = []
+        self._preroll_buf.clear()
+        self._frame_acc = b""
+        self._in_speech = False
+        self.in_speech = False
+        self._speech_run = 0.0
+        self._sil_run = 0.0
+
 
 class BaiduTranslator:
     """双模式翻译器：
@@ -597,6 +1923,9 @@ class BaiduTranslator:
         """翻译文本，返回 (译文, 错误信息)。成功时错误为 None。"""
         if not text.strip():
             return "", None
+        # 源语言就是目标语言时直接返回原文（如中文游戏语音 + 目标中文）
+        if to_lang == "zh" and _detect_lang_simple(text) == "zh":
+            return text, None
         # 优先使用百度官方 API
         if self.has_baidu_api():
             result, err = self._translate_baidu(text, from_lang, to_lang)
@@ -641,6 +1970,9 @@ class BaiduTranslator:
         try:
             src = _MYMEMORY_LANG_MAP.get(from_lang, from_lang)
             tgt = _MYMEMORY_LANG_MAP.get(to_lang, to_lang)
+            if src == "auto":
+                # MyMemory 不支持 auto 源语言，用粗粒度检测兜底
+                src = _detect_lang_simple(text)
             encoded = urllib.parse.quote(text)
             url = (
                 f"https://api.mymemory.translated.net/get?"
@@ -679,6 +2011,13 @@ class SettingsDialog(QDialog):
         self.setMinimumWidth(420)
         self._cfg = dict(current_config)  # copy
         self._build_ui()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 偶发操作的模态弹窗：200ms 淡入 + 12px 上浮（modal 居中，不做缩放原点）
+        if not getattr(self, "_entered", False):
+            self._entered = True
+            rise_fade_in(self, duration=200, rise=12)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -814,7 +2153,7 @@ class SettingsDialog(QDialog):
             "百度 API 免费注册: fanyi-api.baidu.com"
         )
         hint_label.setWordWrap(True)
-        hint_label.setStyleSheet("color: #5f8a83; font-size: 9pt;")
+        hint_label.setStyleSheet("color: #86868b; font-size: 9pt;")
         trans_form.addRow("", hint_label)
         layout.addWidget(trans_group)
 
@@ -865,7 +2204,7 @@ class VoiceEngine(QObject):
     def __init__(self):
         super().__init__()
         self._recognizer = None
-        self._vad = None
+        self._segmenter = None
         self._pa = None
         self._stream = None
         self._running = False
@@ -881,6 +2220,7 @@ class VoiceEngine(QObject):
         self._min_silence_duration = 0.5
         self._min_speech_duration = 0.25
         self._max_speech_duration = 30
+        self._level = 0.0  # 实时输入电平 (0..1)，UI 音量条轮询用
         # 连续模式状态
         self._in_speech = False
 
@@ -900,8 +2240,6 @@ class VoiceEngine(QObject):
             return
         if not os.path.exists(ASR_MODEL):
             raise FileNotFoundError(f"找不到语音识别模型: {ASR_MODEL}")
-        if not os.path.exists(VAD_MODEL):
-            raise FileNotFoundError(f"找不到 VAD 模型: {VAD_MODEL}")
 
         self.status.emit("正在加载语音模型...")
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
@@ -911,17 +2249,14 @@ class VoiceEngine(QObject):
             use_itn=True,
             language=self._language,
         )
-
-        vad_config = sherpa_onnx.VadModelConfig()
-        vad_config.silero_vad.model = VAD_MODEL
-        vad_config.silero_vad.threshold = self._vad_threshold
-        vad_config.silero_vad.min_silence_duration = self._min_silence_duration
-        vad_config.silero_vad.min_speech_duration = self._min_speech_duration
-        vad_config.silero_vad.max_speech_duration = self._max_speech_duration
-        vad_config.sample_rate = SAMPLE_RATE
-        vad_config.num_threads = 1
-        self._vad = sherpa_onnx.VoiceActivityDetector(
-            vad_config, buffer_size_in_seconds=60
+        # sherpa 1.13.x 的 Silero VAD 在部分环境出段损坏（只出 0 采样空段），
+        # 连续监听改用能量分段器，设置里的参数映射过去
+        self._segmenter = _EnergySegmenter(
+            sr=SAMPLE_RATE,
+            gain=2.0,
+            min_speech=max(0.15, self._min_speech_duration * 0.8),
+            min_silence=max(0.4, self._min_silence_duration * 0.9),
+            max_speech=self._max_speech_duration,
         )
 
     def start_ptt(self, device_index=None, language="zh"):
@@ -959,9 +2294,21 @@ class VoiceEngine(QObject):
                     dev_idx = None
             except Exception:
                 dev_idx = None
+        self._level = 0.0  # 归一化输入电平，供 UI 音量条轮询
 
         def callback(in_data, frame_count, time_info, status):
             self._audio_queue.put(in_data)
+            try:
+                samples = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
+                rms = float(np.sqrt(np.mean(samples * samples)))
+                # -45dB..0dB 映射到 0..1，小声也能看出来
+                db = 20.0 * math.log10(rms + 1e-7)
+                norm = max(0.0, min(1.0, (db + 45.0) / 45.0))
+                prev = self._level
+                # 快攻慢放（EMA），电平条动起来自然
+                self._level = norm if norm >= prev else prev * 0.85 + norm * 0.15
+            except Exception:
+                pass
             return (None, pyaudio.paContinue)
 
         self._stream = self._pa.open(
@@ -1022,11 +2369,11 @@ class VoiceEngine(QObject):
             self._recognizer.decode_stream(stream)
             text = stream.result.text.strip()
 
-            if text:
+            if _has_real_text(text):
                 self.finalResult.emit(text)
                 self.status.emit(f"识别完成: {text}")
             else:
-                self.status.emit("未识别到语音内容")
+                self.status.emit("未识别到有效语音内容")
 
         except FileNotFoundError as e:
             self.error.emit(str(e))
@@ -1055,10 +2402,10 @@ class VoiceEngine(QObject):
                     continue
 
                 samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                self._vad.accept_waveform(samples)
+                self._segmenter.accept(samples)
 
                 # UI: 显示说话状态
-                if self._vad.is_speech_detected():
+                if self._segmenter.in_speech:
                     if not self._in_speech:
                         self._in_speech = True
                         self.vadState.emit(True)
@@ -1067,20 +2414,14 @@ class VoiceEngine(QObject):
                         self._in_speech = False
                         self.vadState.emit(False)
 
-                # VAD 检测到完整语音段后会放入队列，直接取出识别
-                while not self._vad.empty():
-                    seg = self._vad.front
-                    audio = np.array(seg.samples, dtype=np.float32)
-                    self._vad.pop()
+                # 能量分段器凑出完整语音段后直接识别
+                for audio in self._segmenter.pop_segments():
                     if len(audio) > SAMPLE_RATE * 0.15:  # 至少 0.15 秒
                         self._recognize_segment(audio)
 
             # 停止时 flush 剩余音频
-            self._vad.flush()
-            while not self._vad.empty():
-                seg = self._vad.front
-                audio = np.array(seg.samples, dtype=np.float32)
-                self._vad.pop()
+            self._segmenter.accept(np.zeros(0, dtype=np.float32))
+            for audio in self._segmenter.pop_segments():
                 if len(audio) > SAMPLE_RATE * 0.15:
                     self._recognize_segment(audio)
 
@@ -1105,7 +2446,7 @@ class VoiceEngine(QObject):
                 stream.accept_waveform(SAMPLE_RATE, samples)
                 self._recognizer.decode_stream(stream)
                 text = stream.result.text.strip()
-                if text:
+                if _has_real_text(text):
                     self.finalResult.emit(text)
                     self.status.emit(f"识别: {text}")
             except Exception as e:
@@ -1156,6 +2497,11 @@ class MainWindow(QMainWindow):
         self._right_panel = None
         self._scroll = None
         self._aurora = None
+        self._entrance_pending = True  # 首次 show 时播放入场动画
+        self._float_geo = None  # 悬浮翻译窗位置
+        self._speaker_device_name = ""  # 上次选择的捕获设备名
+        self._speaker_beta_hint_off = False  # BETA 提示"不再提示"
+        self._speaker_on = False
 
         self.sendFinished.connect(self._on_send_finished)
         self.translateFinished.connect(self._on_translate_finished)
@@ -1177,12 +2523,19 @@ class MainWindow(QMainWindow):
         self._apply_font_size()
         self._apply_vad_params_to_engine()
 
+        # 无边框窗口的边缘缩放手势（应用级事件过滤器）
+        self._resizer = FramelessResizer(self)
+
     # ----------------------------------------------------------
     # 创建所有控件（不组装布局）
     # ----------------------------------------------------------
     def _create_widgets(self):
         self.setWindowTitle(f"{APP_TITLE}  v{APP_VERSION}")
         self.setMinimumSize(720, 600)
+
+        # 自绘标题栏：去掉系统原生边框（用户觉得系统按钮难看），
+        # 拖拽/缩放/最大化由 TitleBar + FramelessResizer 实现
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
 
         # 设置窗口图标
         icon_path = os.path.join(RES_DIR, "app_icon.ico")
@@ -1193,6 +2546,9 @@ class MainWindow(QMainWindow):
 
         # 窗口标识 (不使用透明背景，避免文字溢出)
         self.setObjectName("mainWindow")
+
+        # ---- 自绘标题栏 ----
+        self.title_bar = TitleBar(self)
 
         # ---- 标题行 ----
         self.title_widget = QWidget()
@@ -1391,7 +2747,22 @@ class MainWindow(QMainWindow):
         self.continuous_btn.clicked.connect(self._toggle_continuous)
         voice_btn_row.addWidget(self.continuous_btn)
 
+        # 悬浮翻译：捕获扬声器声音 → 识别 → 翻译 → 悬浮窗
+        self.speaker_btn = QPushButton("🖥  悬浮翻译 BETA")
+        self.speaker_btn.setObjectName("speakerBtn")
+        self.speaker_btn.setCursor(Qt.PointingHandCursor)
+        self.speaker_btn.setToolTip("捕获扬声器播放的语音，识别并翻译，结果显示在悬浮窗")
+        self.speaker_btn.clicked.connect(self._toggle_speaker)
+        voice_btn_row.addWidget(self.speaker_btn)
+
         voice_btn_row.addStretch()
+
+        # 麦克风实时音量条：录音/监听时显示输入电平（排查"识别不到我说话"）
+        self.mic_meter = MicLevelBar()
+        self.mic_meter.setFixedWidth(150)
+        self.mic_meter.setVisible(False)
+        voice_btn_row.addWidget(self.mic_meter)
+        voice_btn_row.addSpacing(10)
 
         self.vad_label = QLabel("")
         self.vad_label.setObjectName("dimLabel")
@@ -1415,9 +2786,13 @@ class MainWindow(QMainWindow):
         hist_layout.addLayout(hist_btn_row)
         self.history_list = QListWidget()
         self.history_list.setMinimumHeight(60)
+        # 长条目自动换行（避免被裁剪），像素级滚动，宽度变化时重算行高
+        self.history_list.setItemDelegate(HistoryListDelegate(self.history_list, max_lines=4))
         self.history_list.setWordWrap(True)
-        self.history_list.setTextElideMode(Qt.ElideNone)
+        self.history_list.setUniformItemSizes(False)
+        self.history_list.setResizeMode(QListView.Adjust)
         self.history_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.history_list.viewport().installEventFilter(self)
         self.history_list.itemDoubleClicked.connect(self._on_history_double_click)
         hist_layout.addWidget(self.history_list)
 
@@ -1427,6 +2802,21 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("就绪")
 
         self.text_input.installEventFilter(self)
+
+        # ---- 悬浮翻译：引擎 + 悬浮窗（隐藏，由按钮开关）----
+        self._speaker_on = False
+        self.float_win = FloatingTranslateWindow()
+        self.speaker_engine = SpeakerEngine(self.translator)
+        self.speaker_engine.partialResult.connect(self.float_add_pending)
+        self.speaker_engine.translated.connect(self.float_add_pair)
+        self.speaker_engine.status.connect(self.status_bar.showMessage)
+        self.speaker_engine.status.connect(self.float_win.set_float_status)
+        self.speaker_engine.error.connect(self._on_speaker_error)
+        self.speaker_engine.finishedSig.connect(self._on_speaker_finished)
+        self.float_win.source_combo.currentIndexChanged.connect(self._on_float_langs_changed)
+        self.float_win.target_combo.currentIndexChanged.connect(self._on_float_langs_changed)
+        self.float_win.device_combo.currentIndexChanged.connect(self._on_float_device_changed)
+        self.float_win.closedByUser.connect(self._on_float_closed)
 
     # ----------------------------------------------------------
     # 布局组装：根据模式切换横竖屏
@@ -1446,104 +2836,34 @@ class MainWindow(QMainWindow):
             self._build_landscape()
         else:
             self._build_portrait()
-        self._apply_glass_shadows()
-        self._polish_combo_popups()
 
-    def _polish_combo_popups(self):
-        """下拉弹层：视图挂自身 QSS（mint 选中/圆角），容器四角真正透明。
-        不能用不透明无边框窗口——四角会露出窗口原始黑色表面产生黑角；
-        用 WA_TranslucentBackground 让四角透明，配合 DWM 关闭淡入过渡避免打开闪黑。
-        注意：不能对弹层容器 setStyleSheet，否则主窗口里弹层视图会丢掉全局 QSS 变成原生样式。"""
-        for combo in self.findChildren(QComboBox):
-            view = combo.view()
-            if view is None:
-                continue
-            container = view.window()
-            if container is None:
-                continue
-            try:
-                # 弹层视图挂自身样式表：选中/圆角样式稳定生效（不依赖全局 QSS）
-                view.setStyleSheet(POPUP_VIEW_QSS)
-                # 隐藏弹层滚动条（滚轮仍可滚动），避免突兀
-                view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-                view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-                # 容器四角透明：圆角由视图自身 QSS 绘制，四角露出下方内容而非黑色
-                container.setAttribute(Qt.WA_TranslucentBackground)
-                container.setWindowFlags(
-                    Qt.Popup | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint
-                )
-                self._disable_native_frame_rendering(container)
-            except Exception:
-                pass
-
-    @staticmethod
-    def _disable_native_frame_rendering(container):
-        """禁用 DWM 对弹窗的原生边框/描边渲染，并关闭淡入过渡，避免打开瞬间闪黑。"""
-        if sys.platform != "win32":
-            return
-        try:
-            import ctypes
-            hwnd = int(container.winId())
-            dwm = ctypes.windll.dwmapi
-            val = ctypes.c_int(1)  # DWMNCRP_DISABLED
-            dwm.DwmSetWindowAttribute(
-                hwnd, 2, ctypes.byref(val), ctypes.sizeof(val)  # DWMWA_NCRENDERING_POLICY
-            )
-            none_color = ctypes.c_uint(0xFFFFFFFE)  # DWMWA_COLOR_NONE
-            dwm.DwmSetWindowAttribute(
-                hwnd, 34, ctypes.byref(none_color), ctypes.sizeof(none_color)  # DWMWA_BORDER_COLOR
-            )
-            # 关闭窗体出现/消失的过渡动画：半透明弹窗淡入时会被合成出黑底
-            trans = ctypes.c_int(1)  # DWMTRANSITION_FORCEDISABLED
-            dwm.DwmSetWindowAttribute(
-                hwnd, 3, ctypes.byref(trans), ctypes.sizeof(trans)  # DWMWA_TRANSITIONS_FORCEDISABLED
-            )
-        except Exception:
-            pass
-
-    def _apply_glass_shadows(self):
-        """给玻璃卡片加悬浮阴影 + hover 浮起动效。"""
-        for group in self.findChildren(QGroupBox):
-            effect = group.graphicsEffect()
-            if not isinstance(effect, QGraphicsDropShadowEffect):
-                effect = QGraphicsDropShadowEffect(self)
-                effect.setBlurRadius(16)
-                effect.setOffset(0, 5)
-                effect.setColor(QColor(15, 118, 110, 38))
-                group.setGraphicsEffect(effect)
-                group.installEventFilter(self)
-
-    def _animate_card_lift(self, obj, enter):
-        """hover 时阴影扩散产生浮起感。"""
-        effect = obj.graphicsEffect()
-        if not isinstance(effect, QGraphicsDropShadowEffect):
-            return
-        for prop, target in (
-            ("blurRadius", 28 if enter else 16),
-            ("yOffset", 10 if enter else 5),
-        ):
-            anim = QPropertyAnimation(effect, prop.encode("ascii"), obj)
-            anim.setDuration(180)
-            anim.setEndValue(target)
-            anim.setEasingCurve(QEasingCurve.OutCubic)
-            anim.start(QPropertyAnimation.DeleteWhenStopped)
+        # 布局切换（设置里改横竖屏）时重播一次卡片入场，作为应用反馈
+        if self.isVisible():
+            QTimer.singleShot(0, self._play_card_entrance)
 
     def _build_portrait(self):
         """竖屏：Bento Grid 单列。"""
-        self.resize(760, 860)
+        self.resize(760, 880)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
-        central = QWidget()
-        scroll.setWidget(central)
-        self.setCentralWidget(scroll)
+        outer = QWidget()
+        outer_lay = QVBoxLayout(outer)
+        outer_lay.setContentsMargins(0, 0, 0, 0)
+        outer_lay.setSpacing(0)
+        outer_lay.addWidget(self.title_bar)
+        outer_lay.addWidget(scroll, 1)
+        self.setCentralWidget(outer)
         self._scroll = scroll
 
+        central = QWidget()
+        scroll.setWidget(central)
+
         root = QVBoxLayout(central)
-        root.setContentsMargins(24, 24, 24, 16)
+        root.setContentsMargins(24, 8, 24, 16)
         root.setSpacing(16)
 
         root.addWidget(self.title_widget)
@@ -1556,7 +2876,7 @@ class MainWindow(QMainWindow):
 
     def _build_landscape(self):
         """横屏：Bento Grid 双列。"""
-        self.resize(1160, 740)
+        self.resize(1160, 820)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(0)
@@ -1569,7 +2889,7 @@ class MainWindow(QMainWindow):
         left_widget = QWidget()
         left_scroll.setWidget(left_widget)
         left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(24, 24, 8, 16)
+        left_layout.setContentsMargins(24, 8, 8, 16)
         left_layout.setSpacing(16)
 
         left_layout.addWidget(self.title_widget)
@@ -1585,19 +2905,22 @@ class MainWindow(QMainWindow):
         # 右侧面板
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(8, 24, 24, 16)
+        right_layout.setContentsMargins(8, 8, 24, 16)
         right_layout.setSpacing(16)
         right_layout.addWidget(self.hist_group)
 
         splitter.addWidget(right_widget)
         splitter.setStretchFactor(0, 3)  # 左 3
         splitter.setStretchFactor(1, 1)  # 右 1
-        splitter.setSizes([860, 300])
-        splitter.splitterMoved.connect(
-            lambda *_: self._relayout_history()
-        )
+        splitter.setSizes([800, 360])
 
-        self.setCentralWidget(splitter)
+        outer = QWidget()
+        outer_lay = QVBoxLayout(outer)
+        outer_lay.setContentsMargins(0, 0, 0, 0)
+        outer_lay.setSpacing(0)
+        outer_lay.addWidget(self.title_bar)
+        outer_lay.addWidget(splitter, 1)
+        self.setCentralWidget(outer)
         self._main_container = splitter
 
     def _apply_font_size(self):
@@ -1630,23 +2953,86 @@ class MainWindow(QMainWindow):
                event.modifiers() & Qt.ControlModifier:
                 self._send()
                 return True
-        # 玻璃卡片 hover 浮起
-        if event.type() in (event.Enter, event.Leave) and \
-                isinstance(obj, QGroupBox) and obj.graphicsEffect():
-            self._animate_card_lift(obj, event.type() == event.Enter)
+        if obj is self.history_list.viewport() and event.type() == event.Resize:
+            # 列表宽度变化 → 换行后的条目高度需要重算。
+            # 高度没变跳过；且必须延迟到事件循环外（在布局事件里直接 dataChanged 会重入崩溃）
+            w = event.size().width()
+            if w != getattr(self, "_hist_last_width", None):
+                self._hist_last_width = w
+                QTimer.singleShot(0, self._refresh_history_hints)
         return super().eventFilter(obj, event)
 
+    def _refresh_history_hints(self):
+        # 注意：不能在这里对 model 发 dataChanged(SizeHintRole)——
+        # 绘制阶段重入模型更新会原生崩溃，必须走视图的公开重排版接口
+        self.history_list.doItemsLayout()
+
     def paintEvent(self, event):
-        """绘制淡绿色极光背景。"""
-        paint_aurora_background(self, event)
+        """淡绿色极光背景：先让 QSS 画底色，再叠极光（顺序反了会被底色盖住）。"""
         super().paintEvent(event)
+        paint_aurora_background(self, event)
+        # 无边框窗口补一圈淡描边，浅色桌面上界定边界
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QColor(52, 199, 89, 45))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(0, 0, self.width() - 1, self.height() - 1)
 
     def resizeEvent(self, event):
-        """窗口大小变化时重绘背景并重排历史列表行高。"""
+        """窗口大小变化时重绘背景。"""
         super().resizeEvent(event)
         self.update()
-        if getattr(self, "history_list", None) is not None:
-            self._relayout_history()
+
+    def toggle_maximize(self):
+        """无边框窗口的自定义最大化：还原到之前的几何，最大化不超过任务栏。"""
+        if getattr(self, "_maxed", False):
+            self._maxed = False
+            geo = getattr(self, "_restore_geo", None)
+            if geo is None:
+                geo = QRect(120, 90, 1160, 820)
+            self.setGeometry(geo)
+        else:
+            self._restore_geo = QRect(self.geometry())
+            screen = QApplication.desktop().availableGeometry(self)
+            self.setGeometry(screen)
+            self._maxed = True
+        self.title_bar.max_btn.setText("\u2750" if self._maxed else "\u25A1")
+
+    def _apply_round_corners(self):
+        """Win11: 让无边框窗口享受系统圆角（Win10 上无此 API，静默跳过）。"""
+        if sys.platform != "win32":
+            return
+        try:
+            hwnd = int(self.winId())
+            DWMWA_WINDOW_CORNER_PREFERENCE = 33
+            pref = ctypes.c_int(2)  # DWMWCP_ROUND
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ctypes.byref(pref), 4
+            )
+        except Exception:
+            pass
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._apply_round_corners()
+        # 首次显示：窗口淡入 + 上浮，卡片 50ms 间隔依次淡入（启动属罕见时刻）
+        if getattr(self, "_entrance_pending", False):
+            self._entrance_pending = False
+            rise_fade_in(self, duration=220, rise=12)
+            QTimer.singleShot(int(80 * MOTION_SCALE), self._play_card_entrance)
+
+    def _entrance_widgets(self):
+        """参与入场动画的顶层卡片（两种布局共用同一批控件）。"""
+        return [
+            self.title_widget, self.subtitle_label, self.conn_group,
+            self.msg_group, self.btn_widget, self.voice_group, self.hist_group,
+        ]
+
+    def _play_card_entrance(self):
+        try:
+            stagger_fade(self._entrance_widgets(), duration=240, step=50)
+        except RuntimeError:
+            pass
 
     # ----------------------------------------------------------
     # 设置对话框
@@ -1704,6 +3090,11 @@ class MainWindow(QMainWindow):
             "translate_mode": self.translate_mode_combo.currentData() or "bilingual",
             "baidu_appid": self.translator._baidu_appid,
             "baidu_secret": self.translator._baidu_secret,
+            "speaker_source": self.float_win.source_lang(),
+            "speaker_target": self.float_win.target_lang(),
+            "speaker_device": self.float_win.current_device_name(),
+            "speaker_beta_hint_off": getattr(self, "_speaker_beta_hint_off", False),
+            "float_geo": self.float_win.save_geo(),
         }
 
     # ----------------------------------------------------------
@@ -1739,11 +3130,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _voice_lang_to_baidu(lang_code):
         """将语音识别语言代码映射为百度翻译语言代码。"""
-        mapping = {
-            "zh": "zh", "en": "en", "ja": "jp",
-            "ko": "kor", "yue": "yue", "auto": "auto",
-        }
-        return mapping.get(lang_code, "auto")
+        return voice_lang_to_baidu(lang_code)
 
     def _on_translate_toggle(self, state):
         """翻译开关变化时保存配置。"""
@@ -1872,6 +3259,8 @@ class MainWindow(QMainWindow):
         self.ptt_btn.setText("⏹  停止识别")
         self.ptt_btn.setObjectName("micRecording")
         self._repolish(self.ptt_btn)
+        start_pulse(self.ptt_btn)  # 录音中呼吸脉冲，状态指示
+        self.mic_meter.start(self.voice)  # 实时输入电平
         self.continuous_btn.setEnabled(False)
         self.mic_combo.setEnabled(False)
         self.lang_combo.setEnabled(False)
@@ -1900,6 +3289,8 @@ class MainWindow(QMainWindow):
         self.continuous_btn.setText("⏹  停止监听")
         self.continuous_btn.setObjectName("micContinuousActive")
         self._repolish(self.continuous_btn)
+        start_pulse(self.continuous_btn)  # 监听中呼吸脉冲，状态指示
+        self.mic_meter.start(self.voice)  # 实时输入电平
         self.ptt_btn.setEnabled(False)
         self.mic_combo.setEnabled(False)
         self.lang_combo.setEnabled(False)
@@ -1915,10 +3306,158 @@ class MainWindow(QMainWindow):
         self.voice_hint.setText("正在停止...")
 
     # ----------------------------------------------------------
+    # 悬浮翻译（回环捕获 → 识别 → 翻译 → 悬浮窗）
+    # ----------------------------------------------------------
+    def _enumerate_loopback_devices(self):
+        """枚举所有输出设备的回环捕获项，默认输出的回环排首位。返回 [(显示名, 设备索引)]。"""
+        if not _HAS_SPEAKER_LIB:
+            return []
+        items = []
+        default_name = None
+        try:
+            p = pyaudio_wp.PyAudio()
+            try:
+                wasapi = p.get_host_api_info_by_type(pyaudio_wp.paWASAPI)
+                out = p.get_device_info_by_index(wasapi["defaultOutputDevice"])
+                default_name = out.get("name", "")
+                for lb in p.get_loopback_device_info_generator():
+                    label = lb["name"].replace(" [Loopback]", "")
+                    items.append((label, lb["index"]))
+            finally:
+                p.terminate()
+        except Exception:
+            return []
+        # 去重（同名设备可能重复枚举），默认输出排最前
+        seen = set()
+        ordered = []
+        for label, idx in items:
+            if idx in seen:
+                continue
+            seen.add(idx)
+            if default_name and default_name in label:
+                ordered.insert(0, (label + "（默认）", idx))
+            else:
+                ordered.append((label, idx))
+        return ordered
+
+    def _toggle_speaker(self):
+        if not self._speaker_on:
+            if not _HAS_SPEAKER_LIB:
+                QMessageBox.warning(
+                    self, "缺少组件",
+                    "缺少 pyaudiowpatch 库，无法捕获扬声器音频。\n请使用安装包重新安装本程序。"
+                )
+                return
+            # BETA 功能首次使用前确认（可勾"不再提示"跳过）
+            if not getattr(self, "_speaker_beta_hint_off", False):
+                box = QMessageBox(self)
+                box.setWindowTitle("悬浮翻译 BETA")
+                box.setText(
+                    "悬浮翻译目前是 BETA 功能，识别和翻译并不准确：\n\n"
+                    "· 游戏/音乐等背景音会明显影响识别效果\n"
+                    "· 识别结果可能有错字或缺词\n\n要继续吗？"
+                )
+                ok_btn = box.addButton("确定", QMessageBox.YesRole)
+                back_btn = box.addButton("返回", QMessageBox.NoRole)
+                dont_btn = box.addButton("不再提示", QMessageBox.ActionRole)
+                box.setDefaultButton(ok_btn)
+                box.exec_()
+                clicked = box.clickedButton()
+                if clicked is back_btn:
+                    return
+                if clicked is dont_btn:
+                    self._speaker_beta_hint_off = True
+                    self._save_config()
+            devices = self._enumerate_loopback_devices()
+            if not devices:
+                QMessageBox.warning(
+                    self, "悬浮翻译",
+                    "没有找到可用的扬声器回环设备，无法捕获系统声音。"
+                )
+                return
+            saved = getattr(self, "_speaker_device_name", "") or ""
+            selected = None
+            for label, idx in devices:
+                if saved and saved in label:
+                    selected = idx
+                    break
+            self.float_win.set_devices(devices, selected)
+            device_index = self.float_win.current_device_index()
+            self.float_win.clear_stream()
+            self.float_win.set_float_status("正在启动...")
+            self.float_win.show_at(getattr(self, "_float_geo", None))
+            self.float_win.start_meter(self.speaker_engine)  # 捕获电平条
+            self.speaker_engine.start(
+                device_index, self.float_win.source_lang(), self.float_win.target_lang()
+            )
+            self._speaker_on = True
+            self._set_speaker_btn_active(True)
+        else:
+            self.speaker_engine.stop()
+            self._on_speaker_finished()
+
+    def _on_float_device_changed(self):
+        """热切换捕获设备：重启捕获线程（悬浮窗保持显示）。"""
+        self._save_config()
+        if not self._speaker_on:
+            return
+        self.float_win.set_float_status("正在切换输出设备...")
+        self.speaker_engine.stop()
+        self.speaker_engine.start(
+            self.float_win.current_device_index(),
+            self.float_win.source_lang(),
+            self.float_win.target_lang(),
+        )
+
+    def _on_float_closed(self):
+        """用户点悬浮窗 ✕：完全停止并复位主窗口按钮。"""
+        if self._speaker_on:
+            self.speaker_engine.stop()
+            self._on_speaker_finished()
+
+    def _set_speaker_btn_active(self, active):
+        self.speaker_btn.setText("⏹  停止翻译" if active else "🖥  悬浮翻译 BETA")
+        self.speaker_btn.setObjectName("speakerBtnActive" if active else "speakerBtn")
+        self._repolish(self.speaker_btn)
+
+    def _on_speaker_finished(self):
+        # 引擎自然结束（错误/停止）时统一复位 UI
+        if self._speaker_on:
+            self._speaker_on = False
+            self._set_speaker_btn_active(False)
+            self.float_win.stop_meter()
+            self.float_win.fade_hide()
+            self.status_bar.showMessage("悬浮翻译已停止")
+
+    def _on_speaker_error(self, msg):
+        self.float_win.set_float_status(msg)
+        if self._speaker_on:
+            QMessageBox.warning(self, "悬浮翻译错误", msg)
+        self._on_speaker_finished()
+
+    def float_add_pending(self, text):
+        if self._speaker_on:
+            self.float_win.add_pending(text)
+
+    def float_add_pair(self, original, translated):
+        if self._speaker_on:
+            self.float_win.add_pair(original, translated)
+
+    def _on_float_langs_changed(self):
+        if hasattr(self, "speaker_engine"):
+            self.speaker_engine.set_langs(
+                self.float_win.source_lang(), self.float_win.target_lang()
+            )
+        self._save_config()
+
+    # ----------------------------------------------------------
     # 语音回调
     # ----------------------------------------------------------
     def _on_partial(self, text):
+        was_empty = not self.partial_label.text()
         self.partial_label.setText(f"识别中: {text}")
+        if was_empty and text:
+            fade_in(self.partial_label, 150)
 
     def _on_final(self, text):
         if self._is_continuous:
@@ -1944,15 +3483,21 @@ class MainWindow(QMainWindow):
 
     def _on_vad_state(self, is_speaking):
         if is_speaking:
-            self.vad_label.setText("🔊 检测到语音...")
-            self.vad_label.setStyleSheet("color: #ff9500;")
+            if not self.vad_label.text() or is_fading_out(self.vad_label):
+                self.vad_label.setText("🔊 检测到语音...")
+                self.vad_label.setStyleSheet("color: #ff9500;")
+                fade_in(self.vad_label, 150)
         else:
-            self.vad_label.setText("")
+            if self.vad_label.text():
+                # 出场更快（100ms），先淡出再清文字
+                fade_out(self.vad_label, 100, finished=lambda: self.vad_label.setText(""))
 
     def _on_voice_error(self, msg):
         self.partial_label.setText("")
         self.vad_label.setText("")
         QMessageBox.warning(self, "语音识别错误", msg)
+        # 错误路径没有"识别完成"状态消息跟进，主动刷新，避免状态栏停在"正在录音..."
+        self.status_bar.showMessage("语音识别出错，请检查麦克风和模型")
 
     def _on_ptt_finished(self):
         was_ptt = self._is_ptt
@@ -1961,6 +3506,9 @@ class MainWindow(QMainWindow):
         self._is_continuous = False
         self._hotkey_toggle_active = False
         self._update_hotkey_btn_visual(False)
+        stop_pulse(self.ptt_btn)
+        stop_pulse(self.continuous_btn)
+        self.mic_meter.stop()
 
         self.ptt_btn.setText("🎤  按住说话")
         self.ptt_btn.setObjectName("micBtn")
@@ -2166,32 +3714,14 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------
     # 历史
     # ----------------------------------------------------------
-    def _relayout_history(self):
-        """按当前列表宽度重算每条历史的高度，放不下自动折行。"""
-        if self.history_list is None:
-            return
-        w = self.history_list.viewport().width() - 22  # 扣除条目内边距
-        if w < 100:
-            w = 100
-        fm = self.history_list.fontMetrics()
-        for i in range(self.history_list.count()):
-            item = self.history_list.item(i)
-            rect = fm.boundingRect(0, 0, w, 100000, Qt.TextWordWrap, item.text())
-            item.setSizeHint(QSize(w + 22, rect.height() + 12))
-
     def _add_history(self, entry):
         self._history.insert(0, entry)
         if len(self._history) > MAX_HISTORY:
             self._history = self._history[:MAX_HISTORY]
         item = QListWidgetItem(entry)
+        item.setToolTip(entry)  # 悬停查看完整内容（换行最多 4 行，超出部分）
         self.history_list.insertItem(0, item)
-        w = self.history_list.viewport().width() - 22  # 扣除条目内边距
-        if w < 100:
-            w = 100
-        rect = self.history_list.fontMetrics().boundingRect(
-            0, 0, w, 100000, Qt.TextWordWrap, entry
-        )
-        item.setSizeHint(QSize(w + 22, rect.height() + 12))
+        flash_history_item(item)  # 新条目绿色高亮淡出，作为发送成功反馈
         self._save_history()
 
     def _on_history_double_click(self, item):
@@ -2217,10 +3747,9 @@ class MainWindow(QMainWindow):
                 with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                     self._history = json.load(f)
                 for item in self._history:
-                    self.history_list.addItem(item)
-                # 等布局就绪后再算行高（否则宽度未定会截断）
-                QTimer.singleShot(0, self._relayout_history)
-                QTimer.singleShot(200, self._relayout_history)
+                    list_item = QListWidgetItem(item)
+                    list_item.setToolTip(item)
+                    self.history_list.addItem(list_item)
         except Exception:
             self._history = []
 
@@ -2291,6 +3820,14 @@ class MainWindow(QMainWindow):
                     if self.translate_mode_combo.itemData(i) == self._translate_mode:
                         self.translate_mode_combo.setCurrentIndex(i)
                         break
+                # 悬浮翻译窗设置（方向：其他语言 → 中文为默认）
+                self.float_win.set_langs(
+                    cfg.get("speaker_source", "auto"),
+                    cfg.get("speaker_target", "zh"),
+                )
+                self._speaker_device_name = cfg.get("speaker_device", "")
+                self._speaker_beta_hint_off = bool(cfg.get("speaker_beta_hint_off", False))
+                self._float_geo = cfg.get("float_geo", None)
         except Exception:
             pass
 
@@ -2328,6 +3865,11 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self._is_ptt or self._is_continuous:
             self.voice.stop()
+        stop_pulse(self.ptt_btn)
+        stop_pulse(self.continuous_btn)
+        self.mic_meter.stop()
+        self.speaker_engine.stop()
+        self.float_win.close()
         self._stop_hotkey_hook()
         try:
             keyboard.unhook_all()
@@ -2339,56 +3881,8 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def _make_combo_arrow_icon():
-    """生成下拉框的小箭头 PNG（chevron），返回可供 QSS url() 使用的路径。"""
-    try:
-        import tempfile
-        d = os.path.join(tempfile.gettempdir(), "vrc_osc_assets")
-        os.makedirs(d, exist_ok=True)
-        path = os.path.join(d, "combo_arrow.png")
-        pm = QPixmap(12, 8)
-        pm.fill(Qt.transparent)
-        painter = QPainter(pm)
-        try:
-            painter.setRenderHint(QPainter.Antialiasing)
-            painter.setPen(QPen(QColor("#4f7d76"), 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-            painter.drawPolyline([QPoint(2, 2), QPoint(6, 6), QPoint(10, 2)])
-        finally:
-            painter.end()
-        if not pm.save(path, "PNG"):
-            return ""
-        return path.replace("\\", "/")
-    except Exception:
-        return ""
-
-
 def main():
-    # Windows 任务栏自定义图标：显式 AppUserModelID，避免归属 python.exe 显示默认图标
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "Txaniag.VRChatOSCChatbox.1"
-            )
-        except Exception:
-            pass
-    # 注意: 必须先创建 QApplication 再设置图标，否则进程会静默退出
     app = QApplication(sys.argv)
-    # 关闭弹层打开动画：Windows 对半透明弹窗做原生淡入时会短暂闪黑边，改为瞬间显示
-    try:
-        app.setEffectEnabled(Qt.UI_AnimateMenu, False)
-    except Exception:
-        pass
-    icon_file = os.path.join(APP_DIR, "app_icon.ico")
-    if not os.path.exists(icon_file):
-        icon_file = os.path.join(RES_DIR, "app_icon.ico")
-    if os.path.exists(icon_file):
-        app.setWindowIcon(QIcon(icon_file))
-    # 生成下拉箭头图标并替换 QSS 中的 @ARROW@ 占位符（QPixmap 依赖 QApplication，必须在 app 之后）
-    global STYLE_SHEET
-    arrow_path = _make_combo_arrow_icon()
-    if arrow_path:
-        STYLE_SHEET = STYLE_SHEET.replace("@ARROW@", arrow_path)
     app.setStyleSheet(STYLE_SHEET)
     window = MainWindow()
     window.show()

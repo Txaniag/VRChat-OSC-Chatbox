@@ -15,19 +15,13 @@
 
 ## 安装使用
 
-### 1. 下载程序
-
-**最新版 v4.1（免安装绿色版，推荐）**
-- [VRChat_OSC_Chatbox.exe](https://github.com/Txaniag/VRChat-OSC-Chatbox/releases/download/v4.1/VRChat_OSC_Chatbox.exe)（约 295 MB，下载后直接双击运行）
-
-**旧版 v4.0（安装程序）**
-- [VRChat_OSC_Chatbox_Setup_v4.exe](https://github.com/Txaniag/VRChat-OSC-Chatbox/releases/download/v4.0/VRChat_OSC_Chatbox_Setup_v4.exe)（238.7 MB）
+### 1. 下载安装程序
+- 前往 [Releases 页面](https://github.com/Txaniag/VRChat-OSC-Chatbox/releases/latest) 下载最新版（推荐 v4.6 及以上，含悬浮翻译 BETA）
 
 ### 2. 运行应用
-- 绿色版：双击 exe 直接运行，无需安装（单文件首次启动需自我解压，等待几秒属正常现象）
-- 安装版：双击安装程序，按向导完成安装，桌面会创建快捷方式
+- 双击安装程序，按向导完成安装
+- 桌面会创建快捷方式
 - 首次运行需要配置 OSC 端口和语音识别设置
-- 如被 Windows SmartScreen 拦截：点击"更多信息 → 仍要运行"
 
 ### 3. 基本设置
 - **OSC 设置**：填写 VRChat 的 OSC 端口（默认 9000）
