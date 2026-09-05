@@ -1368,8 +1368,10 @@ class SpeakerEngine(QObject):
                 # 收尾：把未闭合的段冲出来识别
                 if self._segmenter is not None and self._gen == my_gen:
                     self._segmenter.flush()
+                    rec = self._shared if self._shared is not None else self._recognizer
                     for seg in self._segmenter.pop_segments():
-                        self._recognize(seg)
+                        if rec is not None:
+                            self._recognize_with(rec, seg)
             finally:
                 p.terminate()
         except Exception as e:
