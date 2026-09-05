@@ -16,6 +16,9 @@ import math
 import time
 import ctypes
 import tempfile
+import base64
+import webbrowser
+import winreg
 from collections import deque
 import datetime
 import threading
@@ -35,7 +38,8 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QListView, QAbstractItemView, QGroupBox, QStatusBar,
     QMessageBox, QComboBox, QRadioButton, QButtonGroup, QScrollArea, QFrame,
     QDialog, QSlider, QSpinBox, QFormLayout, QDialogButtonBox, QSplitter,
-    QGraphicsBlurEffect, QGraphicsOpacityEffect, QGraphicsDropShadowEffect, QStyledItemDelegate, QScrollBar
+    QGraphicsBlurEffect, QGraphicsOpacityEffect, QGraphicsDropShadowEffect,
+    QStyledItemDelegate, QScrollBar, QSystemTrayIcon, QMenu
 )
 from PyQt5.QtCore import (
     Qt, QTimer, pyqtSignal, QObject, QPointF, QPoint, QRect, QRectF, QSize,
@@ -77,7 +81,7 @@ VAD_MODEL = os.path.join(MODEL_DIR, "silero_vad.onnx")
 # 常量
 # ============================================================
 APP_TITLE = "VRChat OSC Chatbox Sender"
-APP_VERSION = "4.3.1"
+APP_VERSION = "4.4.0"
 DEFAULT_IP = "127.0.0.1"
 DEFAULT_PORT = 9000
 MAX_CHARS = 144
@@ -1202,6 +1206,8 @@ class SpeakerEngine(QObject):
         self._translator = translator
         self._recognizer = None
         self._segmenter = None
+        self._shared = None  # 借用麦克风识别器（语言一致时）
+        self._shared_lang_hint = None  # 共享识别器对应的语言
         self._running = False
         self._loaded_lang = None  # 识别器当前加载的语言
         self._gen = 0  # 代际计数：热切换输出设备时作废旧工作线程
@@ -1209,6 +1215,7 @@ class SpeakerEngine(QObject):
         self._lang = "auto"
         self._target = "zh"
         self._level = 0.0  # 归一化捕获电平 (0..1)，悬浮窗音量条轮询用
+        self._paused = False  # 暂停捕获（跳过切分与识别，仍刷新电平）
         self._tq = queue.Queue(maxsize=8)
         self._tr_running = False
 
@@ -1217,48 +1224,48 @@ class SpeakerEngine(QObject):
         self._lang = lang or "auto"
         self._target = target or "zh"
 
-    def start(self, device_index, lang, target):
-        """device_index: pyaudiowpatch 回环设备索引；None = 默认输出的回环。"""
+    def start(self, device_index, lang, target, shared_recognizer=None):
+        """device_index: pyaudiowpatch 回环设备索引；None = 默认输出的回环。
+        shared_recognizer: 语言一致时可借用麦克风识别器，省一份模型内存。"""
         self._gen += 1
         my_gen = self._gen
         self._device_index = device_index
         self.set_langs(lang, target)
         self._level = 0.0
+        if shared_recognizer is not None:
+            self._shared = shared_recognizer
+            self._shared_lang_hint = lang
+            self._recognizer = None
+        else:
+            self._shared = None
+            self._recognizer = None
+            self._loaded_lang = None  # 触发后台加载自有模型
         self._running = True
         self._tr_running = True
         threading.Thread(target=self._worker, args=(my_gen,), daemon=True).start()
         threading.Thread(target=self._translator_worker, daemon=True).start()
 
+    def set_paused(self, paused):
+        self._paused = bool(paused)
+
     def stop(self):
         self._gen += 1
         self._running = False
         self._tr_running = False
-
-    def _ensure_models(self):
-        # 语言变更时重建识别器，让"源语言"切换立即生效（否则模型只在首次加载用旧语言）
-        if self._recognizer is not None and self._loaded_lang == self._lang:
-            return
-        if not os.path.exists(ASR_MODEL):
-            raise FileNotFoundError(f"找不到语音识别模型: {ASR_MODEL}")
-        self.status.emit("正在加载翻译模型...")
-        self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            model=ASR_MODEL,
-            tokens=ASR_TOKENS,
-            num_threads=2,
-            use_itn=True,
-            language=self._lang,
-        )
-        self._loaded_lang = self._lang
-        # sherpa 1.13.x Silero VAD 出段损坏，改用能量分段器（参数对扬声器更严格）
-        self._segmenter = _EnergySegmenter(
-            sr=SAMPLE_RATE, gain=1.4, min_speech=0.3, min_silence=0.7, max_speech=10.0
-        )
+        self._shared = None
+        self._recognizer = None
+        self._shared_lang_hint = None
+        self._loaded_lang = None
 
     def _worker(self, my_gen):
         try:
             if not _HAS_SPEAKER_LIB:
                 raise RuntimeError("缺少 pyaudiowpatch 库，请重新安装本程序")
-            self._ensure_models()
+            # 分段器（与识别器独立；识别器可能在后台加载/切换）
+            self._segmenter = _EnergySegmenter(
+                sr=SAMPLE_RATE, gain=1.4, min_speech=0.3, min_silence=0.7, max_speech=10.0
+            )
+            self._maybe_reload()
             p = pyaudio_wp.PyAudio()
             try:
                 if self._device_index is not None:
@@ -1289,9 +1296,9 @@ class SpeakerEngine(QObject):
                 )
                 try:
                     while self._running and self._gen == my_gen:
-                        if self._lang != self._loaded_lang:
-                            self._recognizer = None  # 语言切换 → 重建识别器
-                            self._ensure_models()
+                        self._maybe_reload()
+                        # 优先共享（麦克风）识别器；模型加载中先累积音频不丢内容
+                        recognizer = self._shared if self._shared is not None else self._recognizer
                         data = stream.read(int(rate * 0.1), exception_on_overflow=False)
                         x = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
                         if ch > 1:
@@ -1303,11 +1310,13 @@ class SpeakerEngine(QObject):
                         norm = max(0.0, min(1.0, (db + 45.0) / 45.0))
                         prev = self._level
                         self._level = norm if norm >= prev else prev * 0.85 + norm * 0.15
-                        if self._segmenter is None:
-                            break
+                        if self._segmenter is None or recognizer is None:
+                            continue
+                        if self._paused:
+                            continue  # 暂停：丢弃音频，电平条照常刷新
                         self._segmenter.accept(mono)
                         for seg in self._segmenter.pop_segments():
-                            self._recognize(seg)
+                            self._recognize_with(recognizer, seg)
                 finally:
                     try:
                         stream.stop_stream()
@@ -1329,11 +1338,11 @@ class SpeakerEngine(QObject):
                 self._running = False
                 self.finishedSig.emit()
 
-    def _recognize(self, samples):
+    def _recognize_with(self, recognizer, samples):
         try:
-            stream = self._recognizer.create_stream()
+            stream = recognizer.create_stream()
             stream.accept_waveform(SAMPLE_RATE, samples)
-            self._recognizer.decode_stream(stream)
+            recognizer.decode_stream(stream)
             text = stream.result.text.strip()
             if not _is_real_speech(text):
                 self.status.emit("（这段没识别到清晰语音）")
@@ -1377,6 +1386,7 @@ class SpeakerEngine(QObject):
 # ============================================================
 class FloatingTranslateWindow(QWidget):
     closedByUser = pyqtSignal()  # 用户点 ✕：主窗口应停止引擎并复位按钮
+    pauseToggled = pyqtSignal(bool)  # 用户点 ⏸：暂停/继续捕获
 
     def __init__(self):
         super().__init__(
@@ -1422,6 +1432,13 @@ class FloatingTranslateWindow(QWidget):
         self.target_combo.setToolTip("翻译目标语言")
         head.addWidget(self.target_combo)
 
+        self.pause_btn = QPushButton("\u23F8")  # ⏸
+        self.pause_btn.setObjectName("floatBtn")
+        self.pause_btn.setFixedSize(24, 24)
+        self.pause_btn.setCursor(Qt.PointingHandCursor)
+        self.pause_btn.setToolTip("暂停/继续捕获")
+        head.addWidget(self.pause_btn)
+
         self.close_btn = QPushButton("\u2715")
         self.close_btn.setObjectName("floatBtn")
         self.close_btn.setFixedSize(24, 24)
@@ -1465,9 +1482,13 @@ class FloatingTranslateWindow(QWidget):
         outer.addWidget(card)
 
         self.close_btn.clicked.connect(self._on_user_close)
+        self.pause_btn.clicked.connect(self._toggle_pause)
 
     # ---- 对外接口 ----
     def set_langs(self, source, target):
+        # 源语言默认中文（用户主要翻译英文游戏语音，中文声源极少需要 auto 误判）
+        if source is None or source == "auto":
+            source = "zh"
         for combo, code in ((self.source_combo, source), (self.target_combo, target)):
             if code is None:
                 continue
@@ -1623,6 +1644,20 @@ class FloatingTranslateWindow(QWidget):
 
     def set_float_status(self, text):
         self.status_label.setText(text)
+
+    def _toggle_pause(self):
+        paused = not getattr(self, "_ui_paused", False)
+        self._ui_paused = paused
+        self.pause_btn.setText("▶" if paused else "⏸")
+        self.pause_btn.setToolTip("继续捕获" if paused else "暂停捕获")
+        self.status_label.setText("已暂停捕获" if paused else "继续捕获中...")
+        self.pauseToggled.emit(paused)
+
+    def set_paused_ui(self, paused):
+        """同步暂停按钮显示（如启动时）。"""
+        self._ui_paused = bool(paused)
+        self.pause_btn.setText("▶" if paused else "⏸")
+        self.pause_btn.setToolTip("继续捕获" if paused else "暂停捕获")
 
     def save_geo(self):
         g = self.geometry()
@@ -1889,16 +1924,19 @@ class _EnergySegmenter:
         self._in_speech = False
         self._seg_buf = []
         self._preroll_buf = []
+        self.suppressed = False  # 持续音频（音乐）硬切后的反刷屏抑制
+        self._quiet_run = 0.0
 
         # ---- WebRTC VAD（首选）----
         self._webrtc = None
         try:
             import webrtcvad
-            self._webrtc = webrtcvad.Vad(2)  # 0-3，2=均衡
+            self._webrtc = webrtcvad.Vad(3)  # 0-3，3=最激进（少误报）
             self._frame_samples = int(sr * 0.03)  # 30ms 帧
             self._frame_bytes_len = self._frame_samples * 2  # int16
             self._frame_acc = b""
             self._preroll_n = max(1, int(preroll / 0.03))
+            self._w_noise = None  # 能量门限噪声底，首帧校准
             return
         except Exception:
             pass
@@ -1923,12 +1961,34 @@ class _EnergySegmenter:
 
     def _process_webrtc_frame(self, frame_bytes):
         dur = self._frame_samples / self.sr
+        arr = np.frombuffer(frame_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        # 能量门限：WebRTC 判为语音但音量接近底噪的帧按静音处理，
+        # 从根源上防"没说话也识别出字"（背景噪声被误判成语音）
+        rms = float(np.sqrt(np.mean(arr * arr))) if len(arr) else 0.0
+        if self._w_noise is None:
+            self._w_noise = rms  # 首帧校准到实际环境底噪
+        elif rms < self._w_noise:
+            self._w_noise = rms * 0.9 + self._w_noise * 0.1
+        else:
+            self._w_noise = self._w_noise * 0.999  # 慢速上漂，不被短促声音拉高
         try:
             is_speech = self._webrtc.is_speech(frame_bytes, self.sr)
         except Exception:
             is_speech = False
-        arr = np.frombuffer(frame_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        # 音量接近底噪（<1.5x）不算语音
+        if is_speech and rms < max(self._w_noise * 1.5, 0.003):
+            is_speech = False
         if not self._in_speech:
+            # 抑制期（持续音频硬切后）：等出现 0.4s 安静帧才恢复切分，防止节奏性刷歌词
+            if self.suppressed:
+                if is_speech:
+                    self._quiet_run = 0.0
+                else:
+                    self._quiet_run += dur
+                    if self._quiet_run >= 0.4:
+                        self.suppressed = False
+                        self._quiet_run = 0.0
+                return
             self._preroll_buf.append(arr)
             if len(self._preroll_buf) > self._preroll_n:
                 del self._preroll_buf[:-self._preroll_n]
@@ -1951,6 +2011,7 @@ class _EnergySegmenter:
             total = sum(len(a) for a in self._seg_buf) / self.sr
             if self._sil_run >= self.min_silence or total >= self.max_speech:
                 seg = np.concatenate(self._seg_buf)
+                hard_cut = self._sil_run < self.min_silence  # 没有安静间隙，到时长上限被硬切
                 if self._sil_run >= self.min_silence and self._sil_run * self.sr < len(seg):
                     seg = seg[:len(seg) - int(self._sil_run * self.sr)]
                 if len(seg) >= self.min_speech * self.sr:
@@ -1960,6 +2021,10 @@ class _EnergySegmenter:
                 self.in_speech = False
                 self._speech_run = 0.0
                 self._sil_run = 0.0
+                if hard_cut:
+                    # 持续音频（音乐/长独白）：进入抑制期，等 0.4s 安静帧再恢复
+                    self.suppressed = True
+                    self._quiet_run = 0.0
 
     def _accept_energy(self, x):
         """能量门限兜底路径（webrtcvad 不可用时）。"""
@@ -1968,6 +2033,17 @@ class _EnergySegmenter:
         lvl = self._smooth
         if not self._in_speech:
             self._hist.append(lvl)
+            # 抑制期：等安静了才恢复（与 webrtc 路径同一策略）
+            if self.suppressed:
+                thr = self._noise * self.gain
+                if lvl > thr:
+                    self._quiet_run = 0.0
+                else:
+                    self._quiet_run += len(x) / self.sr
+                    if self._quiet_run >= 0.4:
+                        self.suppressed = False
+                        self._quiet_run = 0.0
+                return
         self._noise = max(min(self._hist), 0.003)
         thr = self._noise * self.gain
         dur = len(x) / self.sr
@@ -1992,6 +2068,7 @@ class _EnergySegmenter:
             total = sum(len(a) for a in self._buf) / self.sr
             if self._sil_run >= self.min_silence or total >= self.max_speech:
                 seg = np.concatenate(self._buf)
+                hard_cut = self._sil_run < self.min_silence
                 if self._sil_run >= self.min_silence and self._sil_run * self.sr < len(seg):
                     seg = seg[:len(seg) - int(self._sil_run * self.sr)]
                 if len(seg) >= self.min_speech * self.sr:
@@ -2001,6 +2078,9 @@ class _EnergySegmenter:
                 self.in_speech = False
                 self._speech_run = 0.0
                 self._sil_run = 0.0
+                if hard_cut:
+                    self.suppressed = True
+                    self._quiet_run = 0.0
 
     def pop_segments(self):
         out, self.segments = self.segments, []
@@ -2023,6 +2103,29 @@ class _EnergySegmenter:
         self._sil_run = 0.0
 
 
+def _obfuscate_secret(text):
+    """轻量 XOR+Base64 混淆（非加密，防明文泄露/截图）。"""
+    if not text:
+        return ""
+    raw = text.encode("utf-8")
+    key = b"VRC-OSC-Chatbox"
+    out = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
+    return base64.b64encode(out).decode("ascii")
+
+
+def _deobfuscate_secret(stored):
+    """反混淆；非混淆格式（旧明文）自动兼容返回原值。"""
+    if not stored:
+        return ""
+    try:
+        raw = base64.b64decode(stored.encode("ascii"))
+        key = b"VRC-OSC-Chatbox"
+        out = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
+        return out.decode("utf-8")
+    except Exception:
+        return stored  # 旧明文直接用
+
+
 class BaiduTranslator:
     """双模式翻译器：
     1. 百度官方 API（需 AppID + 密钥，免费注册: fanyi-api.baidu.com）
@@ -2034,9 +2137,9 @@ class BaiduTranslator:
         self._baidu_secret = ""
 
     def set_credentials(self, appid, secret):
-        """设置百度 API 凭据。"""
+        """设置百度 API 凭据（secret 可为混淆格式或旧明文，自动兼容）。"""
         self._baidu_appid = appid or ""
-        self._baidu_secret = secret or ""
+        self._baidu_secret = _deobfuscate_secret(secret) if secret else ""
 
     def has_baidu_api(self):
         """是否配置了百度官方 API。"""
@@ -2194,6 +2297,18 @@ class SettingsDialog(QDialog):
         font_row.addWidget(self.font_size_slider)
         font_row.addWidget(self.font_size_label)
         layout_form.addRow("字体大小:", font_row)
+
+        # 行为选项
+        self.autostart_chk = QCheckBox("开机自动启动")
+        self.autostart_chk.setChecked(self._cfg.get("autostart", False))
+        self.autostart_chk.setToolTip("登录 Windows 后自动运行（仅打包版生效）")
+        layout_form.addRow("", self.autostart_chk)
+
+        self.tray_chk = QCheckBox("关闭时最小化到托盘")
+        self.tray_chk.setChecked(self._cfg.get("close_to_tray", False))
+        self.tray_chk.setToolTip("点窗口关闭按钮时隐藏到系统托盘而不是退出")
+        layout_form.addRow("", self.tray_chk)
+
         layout.addWidget(layout_group)
 
         # ---- VAD 参数 ----
@@ -2322,6 +2437,8 @@ class SettingsDialog(QDialog):
         self._cfg["translate_mode"] = self.trans_mode_combo.currentData() or "bilingual"
         self._cfg["baidu_appid"] = self.baidu_appid_edit.text().strip()
         self._cfg["baidu_secret"] = self.baidu_secret_edit.text().strip()
+        self._cfg["autostart"] = self.autostart_chk.isChecked()
+        self._cfg["close_to_tray"] = self.tray_chk.isChecked()
         self.accept()
 
     def get_config(self):
@@ -2594,10 +2711,11 @@ class VoiceEngine(QObject):
         """在后台线程中识别一段语音。"""
         def worker():
             try:
-                stream = self._recognizer.create_stream()
-                stream.accept_waveform(SAMPLE_RATE, samples)
-                self._recognizer.decode_stream(stream)
-                text = stream.result.text.strip()
+                with self._decode_lock:
+                    stream = self._recognizer.create_stream()
+                    stream.accept_waveform(SAMPLE_RATE, samples)
+                    self._recognizer.decode_stream(stream)
+                    text = stream.result.text.strip()
                 if _is_real_speech(text):
                     self.finalResult.emit(text)
                     self.status.emit(f"识别: {text}")
@@ -2650,10 +2768,17 @@ class MainWindow(QMainWindow):
         self._scroll = None
         self._aurora = None
         self._entrance_pending = True  # 首次 show 时播放入场动画
+        self._geo_pending = True  # 首次 show 时恢复窗口几何
+        self._saved_win_geo = None
+        self._saved_win_maxed = False
         self._float_geo = None  # 悬浮翻译窗位置
         self._speaker_device_name = ""  # 上次选择的捕获设备名
         self._speaker_beta_hint_off = False  # BETA 提示"不再提示"
         self._speaker_on = False
+        self._close_to_tray = False  # 关闭时最小化到托盘
+        self._force_quit = False    # 托盘"退出"真正退出标志
+        self._autostart = False     # 开机自启
+        self._tray = None
 
         self.sendFinished.connect(self._on_send_finished)
         self.translateFinished.connect(self._on_translate_finished)
@@ -2675,10 +2800,25 @@ class MainWindow(QMainWindow):
         self._apply_font_size()
         self._apply_vad_params_to_engine()
 
+        # 恢复上次窗口位置/大小（夹到可用屏幕范围内）
+        geo = getattr(self, "_saved_window_geo", None)
+        if geo and len(geo) == 4:
+            x, y, w, h = map(int, geo)
+            screen = QApplication.desktop().availableGeometry(self)
+            x = max(screen.left(), min(x, screen.right() - 200))
+            y = max(screen.top(), min(y, screen.bottom() - 200))
+            w = min(w, screen.width())
+            h = min(h, screen.height())
+            self.setGeometry(x, y, w, h)
+
         # 无边框窗口的边缘缩放手势（应用级事件过滤器）
         self._resizer = FramelessResizer(self)
         # 下拉弹层：透明四角 + 去黑边/闪现
         self._polish_combo_popups()
+        # 系统托盘
+        self._setup_tray()
+        # 静默检查更新（延迟，避免拖慢启动）
+        QTimer.singleShot(4000, self._check_for_update)
 
     # ----------------------------------------------------------
     # 创建所有控件（不组装布局）
@@ -2975,6 +3115,7 @@ class MainWindow(QMainWindow):
         self.float_win.target_combo.currentIndexChanged.connect(self._on_float_langs_changed)
         self.float_win.device_combo.currentIndexChanged.connect(self._on_float_device_changed)
         self.float_win.closedByUser.connect(self._on_float_closed)
+        self.float_win.pauseToggled.connect(self._on_float_pause)
 
     # ----------------------------------------------------------
     # 布局组装：根据模式切换横竖屏
@@ -3179,11 +3320,21 @@ class MainWindow(QMainWindow):
     def showEvent(self, event):
         super().showEvent(event)
         self._apply_round_corners()
+        # 恢复上次窗口位置/大小（仅首次显示）
+        if getattr(self, "_geo_pending", True):
+            self._geo_pending = False
+            saved = getattr(self, "_saved_win_geo", None)
+            if saved and len(saved) == 4:
+                x, y, w, h = saved
+                if w >= self.minimumWidth() and h >= self.minimumHeight():
+                    self.setGeometry(x, y, w, h)
         # 首次显示：窗口淡入 + 上浮，卡片 50ms 间隔依次淡入（启动属罕见时刻）
         if getattr(self, "_entrance_pending", False):
             self._entrance_pending = False
             rise_fade_in(self, duration=220, rise=12)
             QTimer.singleShot(int(80 * MOTION_SCALE), self._play_card_entrance)
+            if getattr(self, "_saved_win_maxed", False):
+                QTimer.singleShot(int(350 * MOTION_SCALE), self.toggle_maximize)
 
     def _entrance_widgets(self):
         """参与入场动画的顶层卡片（两种布局共用同一批控件）。"""
@@ -3235,6 +3386,85 @@ class MainWindow(QMainWindow):
             anim.setEndValue(target)
             anim.setEasingCurve(_out_cubic())
             anim.start(QPropertyAnimation.DeleteWhenStopped)
+
+    def _setup_tray(self):
+        """系统托盘：双击显示主窗口，右键菜单显示/退出。"""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon_path = os.path.join(RES_DIR, "app_icon.ico")
+        if not os.path.exists(icon_path):
+            icon_path = os.path.join(APP_DIR, "app_icon.ico")
+        menu = QMenu()
+        act_show = menu.addAction("显示主窗口")
+        act_show.triggered.connect(self._show_from_tray)
+        menu.addSeparator()
+        act_quit = menu.addAction("退出")
+        act_quit.triggered.connect(self._quit_from_tray)
+        self._tray = QSystemTrayIcon(
+            QIcon(icon_path) if os.path.exists(icon_path) else QIcon(), self)
+        self._tray.setContextMenu(menu)
+        self._tray.setToolTip(APP_TITLE)
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self._show_from_tray()
+
+    def _show_from_tray(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self):
+        self._force_quit = True
+        self.close()
+
+    @staticmethod
+    def set_autostart(enabled):
+        """开机自启：写/删 HKCU 启动项（仅打包版有效，源码运行无意义）。"""
+        if not getattr(sys, "frozen", False):
+            return
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                 r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                 0, winreg.KEY_SET_VALUE)
+            if enabled:
+                winreg.SetValueEx(key, "VRChatOSCChatbox", 0, winreg.REG_SZ,
+                                  '"{}"'.format(sys.executable))
+            else:
+                try:
+                    winreg.DeleteValue(key, "VRChatOSCChatbox")
+                except FileNotFoundError:
+                    pass
+            winreg.CloseKey(key)
+        except Exception:
+            pass
+
+    def _check_for_update(self):
+        """启动后静默检查 GitHub 最新版，有新版本在状态栏提示。"""
+        try:
+            req = urllib.request.Request(
+                "https://api.github.com/repos/Txaniag/VRChat-OSC-Chatbox/releases/latest",
+                headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            latest_tag = data.get("tag_name", "")
+            if not latest_tag or not latest_tag.startswith("v"):
+                return
+            cur = APP_VERSION.split(".")
+            latest = latest_tag.lstrip("v").split(".")
+            if tuple(map(int, latest)) > tuple(map(int, cur)):
+                self.status_bar.showMessage(
+                    f"发现新版本 {latest_tag}，点击设置打开下载页")
+                # 更新托盘菜单：加"打开最新版下载页"
+                if self._tray is not None:
+                    act = self._tray.contextMenu().addAction("打开最新版下载页")
+                    act.triggered.connect(
+                        lambda: webbrowser.open(
+                            "https://github.com/Txaniag/VRChat-OSC-Chatbox/releases/latest"))
+        except Exception:
+            pass  # 网络失败静默
 
     def _polish_combo_popups(self):
         """下拉弹层：四角真正透明 + 去黑边/闪现（恢复 v4.1 UI overhaul 的处理）。"""
@@ -3301,6 +3531,10 @@ class MainWindow(QMainWindow):
                 new_cfg.get("baidu_appid", ""),
                 new_cfg.get("baidu_secret", ""),
             )
+            # 行为设置：开机自启 + 关闭到托盘
+            self._autostart = bool(new_cfg.get("autostart", False))
+            self._close_to_tray = bool(new_cfg.get("close_to_tray", False))
+            self.set_autostart(self._autostart)
 
             # 同步到主界面控件
             self.translate_chk.setChecked(self._translate_enabled)
@@ -3323,7 +3557,14 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("设置已保存并应用")
 
     def _get_current_config(self):
+        # 主窗口几何（最大化时保存还原矩形）
+        if getattr(self, "_maxed", False):
+            geo = getattr(self, "_restore_geo", None) or self.geometry()
+        else:
+            geo = self.geometry()
         return {
+            "win_geo": [geo.x(), geo.y(), geo.width(), geo.height()],
+            "win_maxed": bool(getattr(self, "_maxed", False)),
             "layout_mode": self._layout_mode,
             "font_size": self._font_size,
             "vad_threshold": self._vad_threshold,
@@ -3334,13 +3575,18 @@ class MainWindow(QMainWindow):
             "translate_target": self.translate_lang_combo.currentData() or "en",
             "translate_mode": self.translate_mode_combo.currentData() or "bilingual",
             "baidu_appid": self.translator._baidu_appid,
-            "baidu_secret": self.translator._baidu_secret,
+            "baidu_secret": _obfuscate_secret(self.translator._baidu_secret),
+            "autostart": bool(getattr(self, "_autostart", False)),
+            "close_to_tray": bool(getattr(self, "_close_to_tray", False)),
             "speaker_source": self.float_win.source_lang(),
             "speaker_target": self.float_win.target_lang(),
             # 设备下拉未填充（如启动早期）时保留已保存的设备名，避免覆盖丢失
             "speaker_device": self.float_win.current_device_name() or getattr(self, "_speaker_device_name", ""),
             "speaker_beta_hint_off": getattr(self, "_speaker_beta_hint_off", False),
+            "close_to_tray": getattr(self, "_close_to_tray", False),
+            "autostart": getattr(self, "_autostart", False),
             "float_geo": self.float_win.save_geo(),
+            "window_geo": [self.x(), self.y(), self.width(), self.height()],
         }
 
     # ----------------------------------------------------------
@@ -3695,9 +3941,13 @@ class MainWindow(QMainWindow):
             self.float_win.set_float_status("正在启动...")
             self.float_win.show_at(getattr(self, "_float_geo", None))
             self.float_win.start_meter(self.speaker_engine)  # 捕获电平条
-            self.speaker_engine.start(
-                device_index, self.float_win.source_lang(), self.float_win.target_lang()
-            )
+            source = self.float_win.source_lang()
+            # 语言与麦克风识别器一致时借用（省一份模型内存），否则悬浮翻译自建
+            shared = self.voice._recognizer if (
+                self.voice._recognizer is not None
+                and self.voice._language == source) else None
+            self.speaker_engine.start(device_index, source,
+                                      self.float_win.target_lang(), shared)
             self._speaker_on = True
             self._set_speaker_btn_active(True)
         else:
@@ -3711,17 +3961,29 @@ class MainWindow(QMainWindow):
             return
         self.float_win.set_float_status("正在切换输出设备...")
         self.speaker_engine.stop()
-        self.speaker_engine.start(
-            self.float_win.current_device_index(),
-            self.float_win.source_lang(),
-            self.float_win.target_lang(),
-        )
+        source = self.float_win.source_lang()
+        shared = self.voice._recognizer if (
+            self.voice._recognizer is not None
+            and self.voice._language == source) else None
+        self.speaker_engine.start(self.float_win.current_device_index(), source,
+                                  self.float_win.target_lang(), shared)
 
     def _on_float_closed(self):
         """用户点悬浮窗 ✕：完全停止并复位主窗口按钮。"""
         if self._speaker_on:
             self.speaker_engine.stop()
             self._on_speaker_finished()
+
+    def _on_float_pause(self, paused):
+        """用户点 ⏸：暂停/继续捕获（音乐时暂停，不关翻译）。"""
+        self.speaker_engine.set_paused(paused)
+        if not paused and self.speaker_engine._segmenter is not None:
+            # 恢复时清掉暂停前的残留分段状态，避免旧缓冲拼进新内容
+            seg = self.speaker_engine._segmenter
+            seg._seg_buf = []
+            seg._preroll_buf.clear()
+            seg.suppressed = False
+            seg._quiet_run = 0.0
 
     def _set_speaker_btn_active(self, active):
         self.speaker_btn.setText("⏹  停止翻译" if active else "🖥  悬浮翻译 BETA")
@@ -4060,6 +4322,10 @@ class MainWindow(QMainWindow):
                 with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                     self._history = json.load(f)
                 for item in self._history:
+                    # 过滤历史里纯语气词/纯符号的旧条目（规则变更前积累的垃圾）
+                    content = item.split("] ", 1)[1] if "] " in item else item
+                    if not _is_real_speech(content):
+                        continue
                     list_item = QListWidgetItem(item)
                     list_item.setToolTip(item)
                     self.history_list.addItem(list_item)
@@ -4133,14 +4399,20 @@ class MainWindow(QMainWindow):
                     if self.translate_mode_combo.itemData(i) == self._translate_mode:
                         self.translate_mode_combo.setCurrentIndex(i)
                         break
+                # 主窗口几何（showEvent 时应用，避免布局构建时被覆盖）
+                self._saved_win_geo = cfg.get("win_geo", None)
+                self._saved_win_maxed = bool(cfg.get("win_maxed", False))
                 # 悬浮翻译窗设置（方向：其他语言 → 中文为默认）
                 self.float_win.set_langs(
-                    cfg.get("speaker_source", "auto"),
+                    cfg.get("speaker_source", "zh"),
                     cfg.get("speaker_target", "zh"),
                 )
                 self._speaker_device_name = cfg.get("speaker_device", "")
                 self._speaker_beta_hint_off = bool(cfg.get("speaker_beta_hint_off", False))
+                self._close_to_tray = bool(cfg.get("close_to_tray", False))
+                self._autostart = bool(cfg.get("autostart", False))
                 self._float_geo = cfg.get("float_geo", None)
+                self._saved_window_geo = cfg.get("window_geo", None)
         except Exception:
             pass
 
@@ -4176,6 +4448,14 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, event):
+        # 关闭到托盘（设置里可开）：隐藏而不退出
+        if getattr(self, "_close_to_tray", False) and not getattr(self, "_force_quit", False):
+            self._save_config()
+            self._save_history()
+            self.osc.send_typing(False)
+            self.hide()
+            event.ignore()
+            return
         if self._is_ptt or self._is_continuous:
             self.voice.stop()
         stop_pulse(self.ptt_btn)
