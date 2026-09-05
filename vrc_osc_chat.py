@@ -1216,6 +1216,7 @@ class SpeakerEngine(QObject):
         self._target = "zh"
         self._level = 0.0  # 归一化捕获电平 (0..1)，悬浮窗音量条轮询用
         self._paused = False  # 暂停捕获（跳过切分与识别，仍刷新电平）
+        self._reload_busy = False  # 后台重建识别器进行中
         self._tq = queue.Queue(maxsize=8)
         self._tr_running = False
 
@@ -1256,6 +1257,47 @@ class SpeakerEngine(QObject):
         self._recognizer = None
         self._shared_lang_hint = None
         self._loaded_lang = None
+
+    def _build_recognizer(self, lang):
+        """构建识别器（慢操作，需在后台线程调用）。"""
+        if not os.path.exists(ASR_MODEL):
+            raise FileNotFoundError(f"找不到语音识别模型: {ASR_MODEL}")
+        return sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=ASR_MODEL,
+            tokens=ASR_TOKENS,
+            num_threads=2,
+            use_itn=True,
+            language=lang,
+        )
+
+    def _maybe_reload(self):
+        """源语言变化或缺少识别器时，后台重建识别器并原子换入（不阻塞捕获）。"""
+        if getattr(self, "_reload_busy", False):
+            return
+        # 已就绪且语言一致 → 无需处理
+        if self._recognizer is not None and self._loaded_lang == self._lang:
+            return
+        # 共享识别器可用且语言一致 → 直接采用，省内存
+        if self._shared is not None and getattr(self, "_shared_lang_hint", None) == self._lang:
+            self._recognizer = self._shared
+            self._loaded_lang = self._lang
+            return
+        self._reload_busy = True
+        lang = self._lang
+
+        def _work():
+            try:
+                self.status.emit("正在加载翻译模型...")
+                rec = self._build_recognizer(lang)
+                self._recognizer = rec  # 原子换入
+                self._shared = None
+                self._loaded_lang = lang
+            except Exception as e:
+                self.error.emit(f"模型加载失败: {e}")
+            finally:
+                self._reload_busy = False
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _worker(self, my_gen):
         try:
@@ -2464,6 +2506,7 @@ class VoiceEngine(QObject):
         self._recognizer = None
         self._segmenter = None
         self._loaded_language = None  # 识别器当前加载的语言
+        self._decode_lock = threading.Lock()  # 序列化解码，防并发错乱
         self._pa = None
         self._stream = None
         self._running = False
