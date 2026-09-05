@@ -19,6 +19,7 @@ import tempfile
 import base64
 import webbrowser
 import winreg
+from colorsys import rgb_to_hls, hls_to_rgb
 from collections import deque
 import datetime
 import threading
@@ -81,7 +82,7 @@ VAD_MODEL = os.path.join(MODEL_DIR, "silero_vad.onnx")
 # 常量
 # ============================================================
 APP_TITLE = "VRChat OSC Chatbox Sender"
-APP_VERSION = "4.4.0"
+APP_VERSION = "4.5.0"
 DEFAULT_IP = "127.0.0.1"
 DEFAULT_PORT = 9000
 MAX_CHARS = 144
@@ -647,11 +648,122 @@ def _ensure_check_png():
 
 
 _CHECK_PNG = _ensure_check_png()
-if _CHECK_PNG:
-    STYLE_SHEET = _STYLE_SHEET_TEMPLATE.replace("__CHECK_URL__", _CHECK_PNG)
-else:
-    # 生成失败时退回纯色块选中态
-    STYLE_SHEET = _STYLE_SHEET_TEMPLATE.replace("    image: url(__CHECK_URL__);\n", "")
+
+
+# ============================================================
+# 配色主题 - 预设色板，清新绿为默认（排第一）
+# 原理：模板硬编码的是绿色系，其它主题对整个绿色系做色相偏移，
+# 保持明度/饱和度结构不变，得到协调的同系配色
+# ============================================================
+# 需要随主题变化的绿色系 hex（模板与代码里的绿色字面量）
+_GREEN_HEX = [
+    "#f0f8f0", "#1a3a1a", "#6b8f6b", "#527052",
+    "#2da44e", "#34c759", "#1a7a37", "#2cb359", "#269a45",
+    "#ebf5eb", "#e4eee4", "#93ab93", "#d4e8d4", "#c0dec0",
+    "#b0d4b0", "#dcecdc", "#9db89d", "#b0c8b0", "#c0d4c0",
+    "#8fb58f", "#d4e4d4", "#9fd8ac", "#8fae95", "#cfe8d4",
+    "#e8f5ea", "#eef7ef", "#f5fff5", "#7ee787", "#7fa387",
+    "#3a4a3c",
+]
+# 需要随主题变化的绿色系 rgb 三元组（出现在 rgba(...) 里）
+_GREEN_RGB = [
+    "245, 255, 245", "248, 253, 248", "45, 164, 78",
+    "52, 199, 89", "126, 231, 135",
+]
+# 极光背景色（底色 + 3 个光球）
+_AURORA_GREEN = [
+    (240, 248, 240), (120, 200, 130), (100, 220, 180), (180, 220, 100),
+]
+
+THEMES = {
+    "green":  {"name": "清新绿", "accent": "#2da44e"},
+    "blue":   {"name": "天空蓝", "accent": "#0a84ff"},
+    "purple": {"name": "薰衣草", "accent": "#5856d6"},
+    "teal":   {"name": "青碧",   "accent": "#00a6a0"},
+    "orange": {"name": "珊瑚橙", "accent": "#ff7a1a"},
+    "pink":   {"name": "玫瑰粉", "accent": "#ff2d55"},
+}
+
+CURRENT_THEME = "green"
+# 当前主题的强调色（供电平条/历史闪光等代码读取）
+CURRENT_ACCENT_HEX = "#2da44e"
+CURRENT_ACCENT_RGB = (52, 199, 89)
+
+
+def _hex2hls(hexv):
+    h = hexv.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    return rgb_to_hls(r, g, b)
+
+
+def _hls2hex(h, l, s):
+    r, g, b = hls_to_rgb(h % 1.0, l, s)
+    return "#%02x%02x%02x" % (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
+
+def _shift_hex(hexv, dh):
+    h, l, s = _hex2hls(hexv)
+    return _hls2hex(h + dh, l, s)
+
+
+def _shift_rgb(rgbstr, dh):
+    r, g, b = (int(x) / 255.0 for x in rgbstr.split(","))
+    h, l, s = rgb_to_hls(r, g, b)
+    r, g, b = hls_to_rgb((h + dh) % 1.0, l, s)
+    return "%d, %d, %d" % (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
+
+def _theme_hue_shift(theme_id):
+    """相对默认绿色主题的色相偏移量。"""
+    gh, _, _ = _hex2hls(THEMES["green"]["accent"])
+    th, _, _ = _hex2hls(THEMES.get(theme_id, THEMES["green"])["accent"])
+    return th - gh
+
+
+def build_stylesheet(theme_id):
+    """按主题构建主样式表和弹层样式表。"""
+    dh = _theme_hue_shift(theme_id)
+    sheet = _STYLE_SHEET_TEMPLATE
+    popup = POPUP_VIEW_QSS
+    if dh != 0.0:
+        for h in _GREEN_HEX:
+            sheet = sheet.replace(h, _shift_hex(h, dh))
+            popup = popup.replace(h, _shift_hex(h, dh))
+        for rgb in _GREEN_RGB:
+            sheet = sheet.replace(rgb, _shift_rgb(rgb, dh))
+            popup = popup.replace(rgb, _shift_rgb(rgb, dh))
+    if _CHECK_PNG:
+        sheet = sheet.replace("__CHECK_URL__", _CHECK_PNG)
+    else:
+        sheet = sheet.replace("    image: url(__CHECK_URL__);\n", "")
+    return sheet, popup
+
+
+def aurora_colors(theme_id):
+    """按主题返回极光底色 + 3 个光球颜色。"""
+    dh = _theme_hue_shift(theme_id)
+    out = []
+    for (r, g, b) in _AURORA_GREEN:
+        h, l, s = rgb_to_hls(r / 255.0, g / 255.0, b / 255.0)
+        nr, ng, nb = hls_to_rgb((h + dh) % 1.0, l, s)
+        out.append((int(round(nr * 255)), int(round(ng * 255)), int(round(nb * 255))))
+    return out
+
+
+def apply_theme(theme_id):
+    """切换主题：重建样式表并更新模块级强调色，返回 (sheet, popup)。"""
+    global CURRENT_THEME, CURRENT_ACCENT_HEX, CURRENT_ACCENT_RGB
+    CURRENT_THEME = theme_id if theme_id in THEMES else "green"
+    CURRENT_ACCENT_HEX = THEMES[CURRENT_THEME]["accent"]
+    r = _hex2hls(CURRENT_ACCENT_HEX)
+    _h = r[0]
+    # 用与默认绿色相同明度/饱和度的色相偏移得到强调色的 rgb
+    nr, ng, nb = hls_to_rgb(_h, 0.70, 0.62)
+    CURRENT_ACCENT_RGB = (int(round(nr * 255)), int(round(ng * 255)), int(round(nb * 255)))
+    return build_stylesheet(CURRENT_THEME)
+
+
+STYLE_SHEET, POPUP_VIEW_QSS_THEMED = apply_theme(CURRENT_THEME)
 
 
 # ============================================================
@@ -863,7 +975,8 @@ def flash_history_item(item, duration=500):
 
     def _set_bg(alpha):
         try:
-            c = QColor(52, 199, 89, int(alpha))
+            ar, ag, ab = CURRENT_ACCENT_RGB
+            c = QColor(ar, ag, ab, int(alpha))
             item.setBackground(QBrush(c))
         except RuntimeError:
             return
@@ -936,8 +1049,8 @@ class MicLevelBar(QWidget):
 
     @staticmethod
     def _level_color(lvl):
-        """绿(≤0.6) → 橙(0.8) → 红(≥0.95) 连续插值。"""
-        green = QColor("#2da44e")
+        """主题色(≤0.6) → 橙(0.8) → 红(≥0.95) 连续插值。"""
+        green = QColor(CURRENT_ACCENT_HEX)
         orange = QColor("#ff9500")
         red = QColor("#ff3b30")
         if lvl <= 0.6:
@@ -965,7 +1078,8 @@ class MicLevelBar(QWidget):
         r = h / 2.0
         p.setPen(Qt.NoPen)
         # 底槽
-        p.setBrush(QColor(52, 199, 89, 36))
+        ar, ag, ab = CURRENT_ACCENT_RGB
+        p.setBrush(QColor(ar, ag, ab, 36))
         p.drawRoundedRect(QRectF(0, 0, w, h), r, r)
         # 电平填充（平滑追踪值）
         lw = w * max(0.0, min(1.0, self._disp))
@@ -1760,7 +1874,7 @@ class HistoryListDelegate(QStyledItemDelegate):
 # 淡绿色极光背景 - 直接在主窗口 paintEvent 绘制
 # ============================================================
 def paint_aurora_background(widget, event):
-    """在主窗口背景上绘制淡绿色弥散光球。"""
+    """在主窗口背景上绘制淡色弥散光球（颜色随主题变化）。"""
     painter = QPainter(widget)
     painter.setRenderHint(QPainter.Antialiasing)
 
@@ -1768,30 +1882,33 @@ def paint_aurora_background(widget, event):
     if w == 0 or h == 0:
         return
 
-    # 底色: 淡绿白
-    painter.fillRect(event.rect(), QColor(240, 248, 240))
+    # 当前主题的极光配色（底色 + 3 光球）
+    base, b1, b2, b3 = aurora_colors(CURRENT_THEME)
 
-    # 光球 1: 淡绿 - 左上
+    # 底色
+    painter.fillRect(event.rect(), QColor(base[0], base[1], base[2]))
+
+    # 光球 1: 左上
     c1 = QRadialGradient(w * 0.15, h * 0.15, max(w, h) * 0.5)
-    c1.setColorAt(0, QColor(120, 200, 130, 80))
-    c1.setColorAt(0.5, QColor(120, 200, 130, 30))
-    c1.setColorAt(1, QColor(120, 200, 130, 0))
+    c1.setColorAt(0, QColor(b1[0], b1[1], b1[2], 80))
+    c1.setColorAt(0.5, QColor(b1[0], b1[1], b1[2], 30))
+    c1.setColorAt(1, QColor(b1[0], b1[1], b1[2], 0))
     painter.setBrush(QBrush(c1))
     painter.setPen(Qt.NoPen)
     painter.drawEllipse(QPointF(w * 0.15, h * 0.15), w * 0.55, h * 0.55)
 
-    # 光球 2: 淡青绿 - 右下
+    # 光球 2: 右下
     c2 = QRadialGradient(w * 0.85, h * 0.8, max(w, h) * 0.5)
-    c2.setColorAt(0, QColor(100, 220, 180, 60))
-    c2.setColorAt(0.5, QColor(100, 220, 180, 20))
-    c2.setColorAt(1, QColor(100, 220, 180, 0))
+    c2.setColorAt(0, QColor(b2[0], b2[1], b2[2], 60))
+    c2.setColorAt(0.5, QColor(b2[0], b2[1], b2[2], 20))
+    c2.setColorAt(1, QColor(b2[0], b2[1], b2[2], 0))
     painter.setBrush(QBrush(c2))
     painter.drawEllipse(QPointF(w * 0.85, h * 0.8), w * 0.5, h * 0.5)
 
-    # 光球 3: 淡黄绿 - 中上
+    # 光球 3: 中上
     c3 = QRadialGradient(w * 0.6, h * 0.3, max(w, h) * 0.35)
-    c3.setColorAt(0, QColor(180, 220, 100, 40))
-    c3.setColorAt(1, QColor(180, 220, 100, 0))
+    c3.setColorAt(0, QColor(b3[0], b3[1], b3[2], 40))
+    c3.setColorAt(1, QColor(b3[0], b3[1], b3[2], 0))
     painter.setBrush(QBrush(c3))
     painter.drawEllipse(QPointF(w * 0.6, h * 0.3), w * 0.35, h * 0.35)
 
@@ -2342,6 +2459,18 @@ class SettingsDialog(QDialog):
         font_row.addWidget(self.font_size_label)
         layout_form.addRow("字体大小:", font_row)
 
+        # 配色主题（第一个是默认清新绿）
+        self.theme_combo = AnimatedComboBox()
+        for tid, tinfo in THEMES.items():
+            self.theme_combo.addItem(tinfo["name"], tid)
+        cur_theme = self._cfg.get("theme", "green")
+        for i in range(self.theme_combo.count()):
+            if self.theme_combo.itemData(i) == cur_theme:
+                self.theme_combo.setCurrentIndex(i)
+                break
+        self.theme_combo.setToolTip("切换整体配色（按钮、焦点、极光背景等）")
+        layout_form.addRow("配色主题:", self.theme_combo)
+
         # 行为选项
         self.autostart_chk = QCheckBox("开机自动启动")
         self.autostart_chk.setChecked(self._cfg.get("autostart", False))
@@ -2483,6 +2612,7 @@ class SettingsDialog(QDialog):
         self._cfg["baidu_secret"] = self.baidu_secret_edit.text().strip()
         self._cfg["autostart"] = self.autostart_chk.isChecked()
         self._cfg["close_to_tray"] = self.tray_chk.isChecked()
+        self._cfg["theme"] = self.theme_combo.currentData() or "green"
         self.accept()
 
     def get_config(self):
@@ -2796,6 +2926,7 @@ class MainWindow(QMainWindow):
         self._hotkey_key_down = False  # 防止按键自动重复触发
         # 布局和设置参数
         self._layout_mode = "portrait"  # "portrait" or "landscape"
+        self._theme = "green"  # 配色主题
         self._font_size = 10
         self._vad_threshold = 0.5
         self._min_silence_duration = 0.5
@@ -2829,6 +2960,9 @@ class MainWindow(QMainWindow):
         self.translateFinished.connect(self._on_translate_finished)
         self._create_widgets()
         self._load_config()
+        # 非默认主题：加载后立即应用（_apply_font_size 会用主题样式表）
+        if self._theme != "green":
+            self._apply_theme(self._theme)
         self._apply_layout()
 
         self.voice.partialResult.connect(self._on_partial)
@@ -3267,6 +3401,21 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(outer)
         self._main_container = splitter
 
+    def _apply_theme(self, theme_id):
+        """切换配色主题：重建样式表、刷新弹层视图样式、重绘极光。"""
+        global STYLE_SHEET, POPUP_VIEW_QSS_THEMED
+        STYLE_SHEET, POPUP_VIEW_QSS_THEMED = apply_theme(theme_id)
+        self._theme = CURRENT_THEME
+        # 刷新弹层视图的专属样式
+        for combo in self.findChildren(QComboBox) + self.float_win.findChildren(QComboBox):
+            try:
+                combo.view().setStyleSheet(POPUP_VIEW_QSS_THEMED)
+            except Exception:
+                pass
+        # 重建全局样式（含字体大小）并重绘极光
+        self._apply_font_size()
+        self.update()
+
     def _apply_font_size(self):
         """根据设置调整全局字体大小。"""
         app = QApplication.instance()
@@ -3324,7 +3473,8 @@ class MainWindow(QMainWindow):
         # 无边框窗口补一圈淡描边，浅色桌面上界定边界
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.setPen(QColor(52, 199, 89, 45))
+        ar, ag, ab = CURRENT_ACCENT_RGB
+        p.setPen(QColor(ar, ag, ab, 45))
         p.setBrush(Qt.NoBrush)
         p.drawRect(0, 0, self.width() - 1, self.height() - 1)
 
@@ -3522,7 +3672,7 @@ class MainWindow(QMainWindow):
                 continue
             try:
                 # 弹层视图挂专用样式：透明容器下圆角/选中样式稳定生效
-                view.setStyleSheet(POPUP_VIEW_QSS)
+                view.setStyleSheet(POPUP_VIEW_QSS_THEMED)
                 # 隐藏弹层滚动条（滚轮仍可滚动），避免突兀
                 view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
                 view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -3580,6 +3730,10 @@ class MainWindow(QMainWindow):
             self._autostart = bool(new_cfg.get("autostart", False))
             self._close_to_tray = bool(new_cfg.get("close_to_tray", False))
             self.set_autostart(self._autostart)
+            # 配色主题
+            new_theme = new_cfg.get("theme", "green")
+            if new_theme != self._theme:
+                self._apply_theme(new_theme)
 
             # 同步到主界面控件
             self.translate_chk.setChecked(self._translate_enabled)
@@ -3611,6 +3765,7 @@ class MainWindow(QMainWindow):
             "win_geo": [geo.x(), geo.y(), geo.width(), geo.height()],
             "win_maxed": bool(getattr(self, "_maxed", False)),
             "layout_mode": self._layout_mode,
+            "theme": getattr(self, "_theme", "green"),
             "font_size": self._font_size,
             "vad_threshold": self._vad_threshold,
             "min_silence_duration": self._min_silence_duration,
@@ -4422,6 +4577,7 @@ class MainWindow(QMainWindow):
                     self.hotkey_chk.setChecked(True)
                 # 加载布局和参数设置
                 self._layout_mode = cfg.get("layout_mode", "portrait")
+                self._theme = cfg.get("theme", "green")
                 self._font_size = cfg.get("font_size", 10)
                 self._vad_threshold = cfg.get("vad_threshold", 0.5)
                 self._min_silence_duration = cfg.get("min_silence_duration", 0.5)
@@ -4476,6 +4632,7 @@ class MainWindow(QMainWindow):
                 "hotkey_scan_code": self._hotkey_scan_code,
                 "hotkey_mode": self._hotkey_mode,
                 "layout_mode": self._layout_mode,
+            "theme": getattr(self, "_theme", "green"),
                 "font_size": self._font_size,
                 "vad_threshold": self._vad_threshold,
                 "min_silence_duration": self._min_silence_duration,
