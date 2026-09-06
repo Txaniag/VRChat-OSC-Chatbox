@@ -82,7 +82,7 @@ VAD_MODEL = os.path.join(MODEL_DIR, "silero_vad.onnx")
 # 常量
 # ============================================================
 APP_TITLE = "VRChat OSC Chatbox Sender"
-APP_VERSION = "4.5.0"
+APP_VERSION = "4.3.2"
 DEFAULT_IP = "127.0.0.1"
 DEFAULT_PORT = 9000
 MAX_CHARS = 144
@@ -696,9 +696,20 @@ def _hex2hls(hexv):
     return rgb_to_hls(r, g, b)
 
 
+def _hex2rgb(hexv):
+    h = hexv.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
 def _hls2hex(h, l, s):
     r, g, b = hls_to_rgb(h % 1.0, l, s)
     return "#%02x%02x%02x" % (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
+
+def _lighten(hexv, dl):
+    """调整明度（dl 为 -1..1 的增量），保持色相/饱和度。"""
+    h, l, s = _hex2hls(hexv)
+    return _hls2hex(h, min(1.0, max(0.0, l + dl)), s)
 
 
 def _shift_hex(hexv, dh):
@@ -754,12 +765,11 @@ def apply_theme(theme_id):
     """切换主题：重建样式表并更新模块级强调色，返回 (sheet, popup)。"""
     global CURRENT_THEME, CURRENT_ACCENT_HEX, CURRENT_ACCENT_RGB
     CURRENT_THEME = theme_id if theme_id in THEMES else "green"
-    CURRENT_ACCENT_HEX = THEMES[CURRENT_THEME]["accent"]
-    r = _hex2hls(CURRENT_ACCENT_HEX)
-    _h = r[0]
-    # 用与默认绿色相同明度/饱和度的色相偏移得到强调色的 rgb
-    nr, ng, nb = hls_to_rgb(_h, 0.70, 0.62)
-    CURRENT_ACCENT_RGB = (int(round(nr * 255)), int(round(ng * 255)), int(round(nb * 255)))
+    dh = _theme_hue_shift(CURRENT_THEME)
+    # 强调色与样式表完全一致：默认 #2da44e 做色相偏移（绿色主题原样，其它主题同构偏移）
+    CURRENT_ACCENT_HEX = _shift_hex("#2da44e", dh)
+    # 强调亮色 #34c759（电平条轨道/闪光/弹窗边框）随主题色相偏移后转 rgb
+    CURRENT_ACCENT_RGB = _hex2rgb(_shift_hex("#34c759", dh))
     return build_stylesheet(CURRENT_THEME)
 
 
@@ -1330,6 +1340,7 @@ class SpeakerEngine(QObject):
         self._target = "zh"
         self._level = 0.0  # 归一化捕获电平 (0..1)，悬浮窗音量条轮询用
         self._paused = False  # 暂停捕获（跳过切分与识别，仍刷新电平）
+        self._min_rms = 0.02  # 音量阈值（RMS），主窗口设置里同步
         self._reload_busy = False  # 后台重建识别器进行中
         self._tq = queue.Queue(maxsize=8)
         self._tr_running = False
@@ -1419,7 +1430,8 @@ class SpeakerEngine(QObject):
                 raise RuntimeError("缺少 pyaudiowpatch 库，请重新安装本程序")
             # 分段器（与识别器独立；识别器可能在后台加载/切换）
             self._segmenter = _EnergySegmenter(
-                sr=SAMPLE_RATE, gain=1.4, min_speech=0.3, min_silence=0.7, max_speech=10.0
+                sr=SAMPLE_RATE, gain=1.4, min_speech=0.3, min_silence=0.7, max_speech=10.0,
+                min_rms=self._min_rms
             )
             self._maybe_reload()
             p = pyaudio_wp.PyAudio()
@@ -2007,14 +2019,21 @@ _EN_FILLER_RE = re.compile(r"\b(?:um+|uh+|hmm+|ah+|oh+|erm+|huh+)\b", re.IGNOREC
 _PUNCT_GAP_RE = re.compile(r"[，。,.!！?？、；;：:~\-—…\s]+")
 
 
-def _is_real_speech(text):
-    """剔除标点和语气词后是否还有实际内容。
+# 纯语气词过滤开关（设置里可关）：关闭后只过滤纯符号，保留嗯哈哈这类真实应答
+FILTER_FILLERS = True
 
-    "嗯。"、"呃。。"、"哈哈"这类纯语气结果按未识别丢弃；
-    "嗯，我们今天来聊聊"这类语气词开头带实际内容的正常保留。
+
+def _is_real_speech(text):
+    """识别结果分级过滤。
+
+    - 纯符号（。、！、—— 等）：始终丢弃——真实说话几乎不会只发出标点，必是噪声；
+    - 纯语气词（嗯、呃、哈哈 等）：按 FILTER_FILLERS 开关决定，开着过滤、关了保留；
+    - 语气词开头带实际内容（"嗯，我们今天来聊聊"）：始终保留。
     """
     if not _has_real_text(text):
         return False
+    if not FILTER_FILLERS:
+        return True
     residue = _CJK_FILLER_RE.sub("", text)
     residue = _PUNCT_GAP_RE.sub(" ", residue)
     residue = _EN_FILLER_RE.sub("", residue)
@@ -2072,12 +2091,13 @@ class _EnergySegmenter:
     """
 
     def __init__(self, sr=16000, gain=1.4, min_speech=0.25,
-                 min_silence=0.6, max_speech=10.0, preroll=0.7):
+                 min_silence=0.6, max_speech=10.0, preroll=0.7, min_rms=0.02):
         self.sr = sr
         self.gain = gain
         self.min_speech = min_speech
         self.min_silence = min_silence
         self.max_speech = max_speech
+        self.min_rms = min_rms  # 绝对音量阈值：RMS 低于它不算语音
         self.in_speech = False  # 供 UI 说话状态显示
         self.segments = []
         self._speech_run = 0.0
@@ -2137,7 +2157,7 @@ class _EnergySegmenter:
         except Exception:
             is_speech = False
         # 音量接近底噪（<1.5x）不算语音
-        if is_speech and rms < max(self._w_noise * 1.5, 0.003):
+        if is_speech and rms < max(self._w_noise * 1.5, self.min_rms, 0.003):
             is_speech = False
         if not self._in_speech:
             # 抑制期（持续音频硬切后）：等出现 0.4s 安静帧才恢复切分，防止节奏性刷歌词
@@ -2196,7 +2216,7 @@ class _EnergySegmenter:
             self._hist.append(lvl)
             # 抑制期：等安静了才恢复（与 webrtc 路径同一策略）
             if self.suppressed:
-                thr = self._noise * self.gain
+                thr = max(self._noise * self.gain, self.min_rms)
                 if lvl > thr:
                     self._quiet_run = 0.0
                 else:
@@ -2206,7 +2226,7 @@ class _EnergySegmenter:
                         self._quiet_run = 0.0
                 return
         self._noise = max(min(self._hist), 0.003)
-        thr = self._noise * self.gain
+        thr = max(self._noise * self.gain, self.min_rms)
         dur = len(x) / self.sr
         if not self._in_speech:
             self._buf.append(x)
@@ -2482,24 +2502,33 @@ class SettingsDialog(QDialog):
         self.tray_chk.setToolTip("点窗口关闭按钮时隐藏到系统托盘而不是退出")
         layout_form.addRow("", self.tray_chk)
 
+        self.filter_filler_chk = QCheckBox("过滤纯语气词识别（嗯、哈哈等）")
+        self.filter_filler_chk.setChecked(self._cfg.get("filter_fillers", True))
+        self.filter_filler_chk.setToolTip("没说话时背景噪声会被误识别成语气词；取消勾选后只过滤纯符号，保留真实的“嗯”“哈哈”等应答")
+        layout_form.addRow("", self.filter_filler_chk)
+
         layout.addWidget(layout_group)
 
         # ---- VAD 参数 ----
         vad_group = QGroupBox("语音检测参数 (VAD)")
         vad_form = QFormLayout(vad_group)
 
+        # 最低触发音量：声音 RMS 超过该值才识别（越高越不敏感），0.001~0.1
+        _vt = self._cfg.get("vad_threshold", 0.02)
+        if not isinstance(_vt, (int, float)) or _vt > 0.15:
+            _vt = 0.02  # 旧版灵敏度值（0.1~0.9）迁移为新音量阈值
         self.vad_threshold_slider = QSlider(Qt.Horizontal)
-        self.vad_threshold_slider.setMinimum(10)
-        self.vad_threshold_slider.setMaximum(90)
-        self.vad_threshold_slider.setValue(int(self._cfg.get("vad_threshold", 0.5) * 100))
-        self.vad_threshold_label = QLabel(f"{self.vad_threshold_slider.value() / 100:.2f}")
+        self.vad_threshold_slider.setMinimum(1)
+        self.vad_threshold_slider.setMaximum(100)
+        self.vad_threshold_slider.setValue(int(_vt * 1000))
+        self.vad_threshold_label = QLabel(f"{self.vad_threshold_slider.value() / 1000:.3f}")
         self.vad_threshold_slider.valueChanged.connect(
-            lambda v: self.vad_threshold_label.setText(f"{v / 100:.2f}")
+            lambda v: self.vad_threshold_label.setText(f"{v / 1000:.3f}")
         )
         vad_threshold_row = QHBoxLayout()
         vad_threshold_row.addWidget(self.vad_threshold_slider)
         vad_threshold_row.addWidget(self.vad_threshold_label)
-        vad_form.addRow("灵敏度阈值:", vad_threshold_row)
+        vad_form.addRow("最低触发音量:", vad_threshold_row)
 
         self.silence_dur_slider = QSlider(Qt.Horizontal)
         self.silence_dur_slider.setMinimum(200)
@@ -2601,7 +2630,7 @@ class SettingsDialog(QDialog):
     def _on_save(self):
         self._cfg["layout_mode"] = "landscape" if self.landscape_radio.isChecked() else "portrait"
         self._cfg["font_size"] = self.font_size_slider.value()
-        self._cfg["vad_threshold"] = self.vad_threshold_slider.value() / 100
+        self._cfg["vad_threshold"] = self.vad_threshold_slider.value() / 1000
         self._cfg["min_silence_duration"] = self.silence_dur_slider.value() / 1000
         self._cfg["min_speech_duration"] = self.min_speech_slider.value() / 1000
         self._cfg["max_chars"] = self.max_chars_spin.value()
@@ -2612,6 +2641,7 @@ class SettingsDialog(QDialog):
         self._cfg["baidu_secret"] = self.baidu_secret_edit.text().strip()
         self._cfg["autostart"] = self.autostart_chk.isChecked()
         self._cfg["close_to_tray"] = self.tray_chk.isChecked()
+        self._cfg["filter_fillers"] = self.filter_filler_chk.isChecked()
         self._cfg["theme"] = self.theme_combo.currentData() or "green"
         self.accept()
 
@@ -2650,7 +2680,7 @@ class VoiceEngine(QObject):
         self._use_itn = True
         self._device_index = None
         # VAD 参数（可外部调整）
-        self._vad_threshold = 0.5
+        self._vad_threshold = 0.02  # 音量阈值（RMS），低于它不算语音
         self._min_silence_duration = 0.5
         self._min_speech_duration = 0.25
         self._max_speech_duration = 30
@@ -2697,6 +2727,7 @@ class VoiceEngine(QObject):
             min_speech=max(0.15, self._min_speech_duration * 0.8),
             min_silence=max(0.4, self._min_silence_duration * 0.9),
             max_speech=self._max_speech_duration,
+            min_rms=self._vad_threshold,
         )
 
     def start_ptt(self, device_index=None, language="zh"):
@@ -2928,7 +2959,7 @@ class MainWindow(QMainWindow):
         self._layout_mode = "portrait"  # "portrait" or "landscape"
         self._theme = "green"  # 配色主题
         self._font_size = 10
-        self._vad_threshold = 0.5
+        self._vad_threshold = 0.02  # 音量阈值（RMS）
         self._min_silence_duration = 0.5
         self._min_speech_duration = 0.25
         self._max_chars = 144
@@ -3439,6 +3470,9 @@ class MainWindow(QMainWindow):
             min_silence=self._min_silence_duration,
             min_speech=self._min_speech_duration,
         )
+        # 悬浮翻译引擎同步音量阈值
+        if hasattr(self, "speaker_engine"):
+            self.speaker_engine._min_rms = self._vad_threshold
 
     def eventFilter(self, obj, event):
         if obj is self.text_input and event.type() == event.KeyPress:
@@ -3636,6 +3670,12 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    @staticmethod
+    def set_filter_fillers(enabled):
+        """纯语气词过滤开关：影响 _is_real_speech 的分级判定。"""
+        global FILTER_FILLERS
+        FILTER_FILLERS = bool(enabled)
+
     def _check_for_update(self):
         """启动后静默检查 GitHub 最新版，有新版本在状态栏提示。"""
         try:
@@ -3715,7 +3755,7 @@ class MainWindow(QMainWindow):
             old_mode = self._layout_mode
             self._layout_mode = new_cfg.get("layout_mode", "portrait")
             self._font_size = new_cfg.get("font_size", 10)
-            self._vad_threshold = new_cfg.get("vad_threshold", 0.5)
+            self._vad_threshold = new_cfg.get("vad_threshold", 0.02)
             self._min_silence_duration = new_cfg.get("min_silence_duration", 0.5)
             self._min_speech_duration = new_cfg.get("min_speech_duration", 0.25)
             self._max_chars = new_cfg.get("max_chars", 144)
@@ -3730,6 +3770,8 @@ class MainWindow(QMainWindow):
             self._autostart = bool(new_cfg.get("autostart", False))
             self._close_to_tray = bool(new_cfg.get("close_to_tray", False))
             self.set_autostart(self._autostart)
+            # 纯语气词过滤开关（模块级变量，影响识别结果分级）
+            self.set_filter_fillers(bool(new_cfg.get("filter_fillers", True)))
             # 配色主题
             new_theme = new_cfg.get("theme", "green")
             if new_theme != self._theme:
@@ -4579,7 +4621,9 @@ class MainWindow(QMainWindow):
                 self._layout_mode = cfg.get("layout_mode", "portrait")
                 self._theme = cfg.get("theme", "green")
                 self._font_size = cfg.get("font_size", 10)
-                self._vad_threshold = cfg.get("vad_threshold", 0.5)
+                # 音量阈值（RMS）：旧版灵敏度值 0.1~0.9 迁移为 0.02
+                _vt = cfg.get("vad_threshold", 0.02)
+                self._vad_threshold = _vt if (isinstance(_vt, (int, float)) and 0 < _vt <= 0.15) else 0.02
                 self._min_silence_duration = cfg.get("min_silence_duration", 0.5)
                 self._min_speech_duration = cfg.get("min_speech_duration", 0.25)
                 self._max_chars = cfg.get("max_chars", 144)
@@ -4612,6 +4656,7 @@ class MainWindow(QMainWindow):
                 self._speaker_beta_hint_off = bool(cfg.get("speaker_beta_hint_off", False))
                 self._close_to_tray = bool(cfg.get("close_to_tray", False))
                 self._autostart = bool(cfg.get("autostart", False))
+                self.set_filter_fillers(bool(cfg.get("filter_fillers", True)))
                 self._float_geo = cfg.get("float_geo", None)
                 self._saved_window_geo = cfg.get("window_geo", None)
         except Exception:
