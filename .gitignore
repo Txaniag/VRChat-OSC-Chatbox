@@ -13,3 +13,5 @@ config.json
 hdr.txt
 resp400.html
 up41.json
+edge_host/bin/
+edge_host/obj/

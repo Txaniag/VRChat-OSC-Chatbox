@@ -83,7 +83,7 @@ DENOISER_MODEL = os.path.join(MODEL_DIR, "gtcrn_simple.onnx")
 # 常量
 # ============================================================
 APP_TITLE = "VRChat OSC Chatbox Sender"
-APP_VERSION = "4.3.2"
+APP_VERSION = "4.4.0"
 DEFAULT_IP = "127.0.0.1"
 DEFAULT_PORT = 9000
 MAX_CHARS = 144
@@ -1314,6 +1314,106 @@ class FramelessResizer(QObject):
             win.unsetCursor()
         return False
 
+
+# ============================================================
+# Edge 在线语音识别 - subprocess 管理 C# WebView2 宿主
+# ============================================================
+EDGE_LANG_MAP = {
+    "zh": "zh-CN", "en": "en-US", "ja": "ja-JP",
+    "ko": "ko-KR", "yue": "zh-HK", "auto": "zh-CN",
+}
+
+def _edge_host_exe():
+    """定位 EdgeSpeechHost.exe：源码时在 edge_host/publish，打包后在 _MEIPASS/edge_host。"""
+    cands = [
+        os.path.join(RES_DIR, "edge_host", "EdgeSpeechHost.exe"),
+        os.path.join(APP_DIR, "edge_host", "EdgeSpeechHost.exe"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "edge_host",
+                     "bin", "Release", "net8.0-windows", "win-x64", "publish", "EdgeSpeechHost.exe"),
+    ]
+    for c in cands:
+        if os.path.exists(c):
+            return c
+    return None
+
+class EdgeRecognizer:
+    """Edge 在线识别（WebView2 + Web Speech API），stdin/stdout JSON 通信。"""
+    def __init__(self):
+        self._proc = None
+        self._reader = None
+        self._lock = threading.Lock()
+        self.on_result = None
+        self.on_error = None
+        self.on_listening = None
+        self._ready = False
+        self._start_pending = None  # (lang,)
+
+    def running(self):
+        return self._proc is not None and self._proc.poll() is None
+
+    def start(self, lang="zh-CN"):
+        with self._lock:
+            if self.running():
+                self._send({"cmd": "start", "lang": lang})
+                return
+            exe = _edge_host_exe()
+            if not exe:
+                if self.on_error: self.on_error("未找到 EdgeSpeechHost.exe")
+                return
+            CREATE_NO_WINDOW = 0x08000000
+            self._proc = subprocess.Popen(
+                [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                creationflags=CREATE_NO_WINDOW)
+            self._reader = threading.Thread(target=self._read_loop, daemon=True)
+            self._reader.start()
+            self._start_pending = (lang,)
+
+    def stop(self):
+        with self._lock:
+            if self.running():
+                self._send({"cmd": "exit"})
+            self._proc = None
+            self._ready = False
+
+    def set_lang(self, lang):
+        self._send({"cmd": "set_lang", "lang": lang})
+
+    def _send(self, obj):
+        try:
+            if self.running():
+                self._proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                self._proc.stdin.flush()
+        except Exception:
+            pass
+
+    def _read_loop(self):
+        try:
+            for line in self._proc.stdout:
+                line = line.strip()
+                if not line: continue
+                try:
+                    m = json.loads(line)
+                except Exception:
+                    continue
+                t = m.get("type")
+                if t == "result":
+                    txt = (m.get("text") or "").strip()
+                    if txt and self.on_result: self.on_result(txt)
+                elif t == "listening":
+                    self._ready = True
+                    if self.on_listening: self.on_listening()
+                elif t == "error":
+                    if self.on_error: self.on_error(m.get("code") or m.get("msg") or "edge-error")
+                elif t == "started":
+                    self._ready = True
+                    with self._lock:
+                        if self._start_pending:
+                            lang = self._start_pending
+                            self._start_pending = None
+                            self._send({"cmd": "start", "lang": lang[0]})
+        except Exception:
+            pass
 
 # ============================================================
 # 扬声器悬浮翻译引擎 - 捕获扬声器回环音频 → 能量切段 → 识别 → 翻译
@@ -2732,8 +2832,15 @@ class VoiceEngine(QObject):
         self._level = 0.0  # 实时输入电平 (0..1)，UI 音量条轮询用
         self._enable_denoiser = False  # 识别前降噪（GTCRN）
         self._denoiser = None
+        self._engine_type = "onnx"  # "onnx" 离线 SenseVoice / "edge" 在线 WebView2
+        self._edge = None  # EdgeRecognizer 实例（惰性）
+        self._edge_stop = threading.Event()
         # 连续模式状态
         self._in_speech = False
+
+    def set_engine_type(self, engine_type):
+        """切换识别引擎：onnx 离线 / edge 在线。运行中切换会在下次启动时生效。"""
+        self._engine_type = engine_type or "onnx"
 
     def set_language(self, language):
         """更新识别语言（连续监听运行中也会在下一个音频块生效）。"""
@@ -2786,6 +2893,9 @@ class VoiceEngine(QObject):
         self._ptt_buffer = []
         self._stop_flag = False
         self._running = True
+        if self._engine_type == "edge":
+            threading.Thread(target=self._edge_worker, daemon=True).start()
+            return
         threading.Thread(target=self._ptt_worker, daemon=True).start()
 
     def start_continuous(self, device_index=None, language="zh"):
@@ -2797,10 +2907,14 @@ class VoiceEngine(QObject):
         self._stop_flag = False
         self._running = True
         self._in_speech = False
+        if self._engine_type == "edge":
+            threading.Thread(target=self._edge_worker, daemon=True).start()
+            return
         threading.Thread(target=self._continuous_worker, daemon=True).start()
 
     def stop(self):
         self._stop_flag = True
+        self._edge_stop.set()
 
     def _open_stream(self):
         self._pa = pyaudio.PyAudio()
@@ -2864,6 +2978,33 @@ class VoiceEngine(QObject):
     # ----------------------------------------------------------
     # PTT 模式
     # ----------------------------------------------------------
+    def _edge_worker(self):
+        """Edge 在线识别流程：启动宿主→持续识别→回调 finalResult→等停止。"""
+        try:
+            if self._edge is None:
+                self._edge = EdgeRecognizer()
+                self._edge.on_result = self._on_edge_result
+                self._edge.on_error = lambda e: self.error.emit("Edge识别: " + str(e))
+            lang = EDGE_LANG_MAP.get(self._language, "zh-CN")
+            self._edge_stop.clear()
+            self._edge.start(lang)
+            self.status.emit("Edge 在线识别中...")
+            while self._running and not self._edge_stop.is_set():
+                time.sleep(0.2)
+        finally:
+            if self._edge is not None:
+                self._edge.stop()
+            self._running = False
+            self._in_speech = False
+            self.pttFinished.emit()
+
+    def _on_edge_result(self, text):
+        """Edge 识别到的一句话 → 走和离线一样的后续（过滤+发送/填入）。"""
+        if not _is_real_speech(text):
+            return
+        self.finalResult.emit(text)
+        self.status.emit(f"识别: {text}")
+
     def _ptt_worker(self):
         try:
             self._init_models()
@@ -3007,6 +3148,7 @@ class MainWindow(QMainWindow):
         # 布局和设置参数
         self._layout_mode = "portrait"  # "portrait" or "landscape"
         self._theme = "green"  # 配色主题
+        self._engine_type = "onnx"  # 识别引擎：onnx 离线 / edge 在线
         self._font_size = 10
         self._vad_threshold = 0.02  # 音量阈值（RMS）
         self._enable_denoiser = False  # 识别前降噪（GTCRN）
@@ -3055,9 +3197,17 @@ class MainWindow(QMainWindow):
 
         self._load_history()
         self._populate_mics()
+        # 同步识别引擎下拉到配置值
+        for i in range(self.engine_combo.count()):
+            if self.engine_combo.itemData(i) == self._engine_type:
+                self.engine_combo.blockSignals(True)
+                self.engine_combo.setCurrentIndex(i)
+                self.engine_combo.blockSignals(False)
+                break
         self._connect_osc()
         self._update_char_count()
         self._apply_font_size()
+        self.voice.set_engine_type(self._engine_type)
         self._apply_vad_params_to_engine()
 
         # 恢复上次窗口位置/大小（夹到可用屏幕范围内）
@@ -3234,6 +3384,16 @@ class MainWindow(QMainWindow):
             lambda: (self.voice.set_language(self.lang_combo.currentData() or "zh"),
                      self._save_config()))
         settings_row.addWidget(self.lang_combo)
+        settings_row.addSpacing(6)
+        settings_row.addWidget(QLabel("引擎:"))
+        self.engine_combo = AnimatedComboBox()
+        self.engine_combo.addItem("离线 SenseVoice", "onnx")
+        self.engine_combo.addItem("Edge 在线", "edge")
+        self.engine_combo.setToolTip("离线识别不用联网；Edge 在线识别用微软云（中文效果更好，需联网）")
+        self.engine_combo.currentIndexChanged.connect(
+            lambda: (self.voice.set_engine_type(self.engine_combo.currentData() or "onnx"),
+                     self._save_config()))
+        settings_row.addWidget(self.engine_combo)
         voice_layout.addLayout(settings_row)
 
         # 自动发送单独一行
@@ -3825,6 +3985,9 @@ class MainWindow(QMainWindow):
             self.set_autostart(self._autostart)
             # 纯语气词过滤开关（模块级变量，影响识别结果分级）
             self.set_filter_fillers(bool(new_cfg.get("filter_fillers", True)))
+            # 识别引擎切换（下次启动识别时生效）
+            self._engine_type = new_cfg.get("engine_type", "onnx")
+            self.voice.set_engine_type(self._engine_type)
             # 降噪开关
             self._enable_denoiser = bool(new_cfg.get("enable_denoiser", False))
             # 配色主题
@@ -3876,6 +4039,7 @@ class MainWindow(QMainWindow):
             "autostart": bool(getattr(self, "_autostart", False)),
             "close_to_tray": bool(getattr(self, "_close_to_tray", False)),
             "enable_denoiser": bool(getattr(self, "_enable_denoiser", False)),
+            "engine_type": getattr(self, "_engine_type", "onnx"),
             "speaker_source": self.float_win.source_lang(),
             "speaker_target": self.float_win.target_lang(),
             # 设备下拉未填充（如启动早期）时保留已保存的设备名，避免覆盖丢失
@@ -4713,6 +4877,7 @@ class MainWindow(QMainWindow):
                 self._close_to_tray = bool(cfg.get("close_to_tray", False))
                 self._autostart = bool(cfg.get("autostart", False))
                 self.set_filter_fillers(bool(cfg.get("filter_fillers", True)))
+                self._engine_type = cfg.get("engine_type", "onnx")
                 self._enable_denoiser = bool(cfg.get("enable_denoiser", False))
                 self._float_geo = cfg.get("float_geo", None)
                 self._saved_window_geo = cfg.get("window_geo", None)
