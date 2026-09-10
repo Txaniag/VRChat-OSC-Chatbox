@@ -77,6 +77,7 @@ SENSEVOICE_DIR = os.path.join(MODEL_DIR, "sherpa-onnx-sense-voice-zh-en-ja-ko-yu
 ASR_MODEL = os.path.join(SENSEVOICE_DIR, "model.int8.onnx")
 ASR_TOKENS = os.path.join(SENSEVOICE_DIR, "tokens.txt")
 VAD_MODEL = os.path.join(MODEL_DIR, "silero_vad.onnx")
+DENOISER_MODEL = os.path.join(MODEL_DIR, "gtcrn_simple.onnx")
 
 # ============================================================
 # 常量
@@ -1341,6 +1342,8 @@ class SpeakerEngine(QObject):
         self._level = 0.0  # 归一化捕获电平 (0..1)，悬浮窗音量条轮询用
         self._paused = False  # 暂停捕获（跳过切分与识别，仍刷新电平）
         self._min_rms = 0.02  # 音量阈值（RMS），主窗口设置里同步
+        self._enable_denoiser = False  # 识别前降噪（GTCRN）
+        self._denoiser = None
         self._reload_busy = False  # 后台重建识别器进行中
         self._tq = queue.Queue(maxsize=8)
         self._tr_running = False
@@ -1510,6 +1513,7 @@ class SpeakerEngine(QObject):
 
     def _recognize_with(self, recognizer, samples):
         try:
+            samples = _maybe_denoise(self, samples)
             stream = recognizer.create_stream()
             stream.accept_waveform(SAMPLE_RATE, samples)
             recognizer.decode_stream(stream)
@@ -2082,6 +2086,41 @@ def _resample_linear(x, sr_in, sr_out):
     ).astype(np.float32)
 
 
+def _load_denoiser():
+    """加载 GTCRN 实时降噪模型（sherpa-onnx 官方生态，VRCTA 同款 gtcrn_simple.onnx）。"""
+    if not os.path.exists(DENOISER_MODEL):
+        return None
+    try:
+        cfg = sherpa_onnx.OfflineSpeechDenoiserConfig()
+        cfg.model.gtcrn.model = DENOISER_MODEL
+        cfg.model.num_threads = 2
+        return sherpa_onnx.OfflineSpeechDenoiser(cfg)
+    except Exception:
+        return None
+
+
+def _maybe_denoise(engine, samples):
+    """识别前降噪（引擎启用降噪开关时）。失败静默回退原样，不阻断识别。"""
+    if not getattr(engine, "_enable_denoiser", False):
+        return samples
+    dn = getattr(engine, "_denoiser", None)
+    if dn is None:
+        dn = _load_denoiser()
+        try:
+            engine._denoiser = dn
+        except Exception:
+            engine._denoiser = False
+            return samples
+    if dn in (None, False):
+        return samples
+    try:
+        out = dn.run(samples, SAMPLE_RATE)
+        res = np.asarray(out.samples, dtype=np.float32)
+        return res if len(res) else samples
+    except Exception:
+        return samples
+
+
 class _EnergySegmenter:
     """语音分段器（WebRTC VAD 帧判定，能量门限兜底）。
 
@@ -2530,6 +2569,11 @@ class SettingsDialog(QDialog):
         vad_threshold_row.addWidget(self.vad_threshold_label)
         vad_form.addRow("最低触发音量:", vad_threshold_row)
 
+        self.denoiser_chk = QCheckBox("识别前降噪（GTCRN）")
+        self.denoiser_chk.setChecked(self._cfg.get("enable_denoiser", False))
+        self.denoiser_chk.setToolTip("嘈杂环境下先降噪再识别，能减少误识别；会略微增加识别耗时")
+        vad_form.addRow("", self.denoiser_chk)
+
         self.silence_dur_slider = QSlider(Qt.Horizontal)
         self.silence_dur_slider.setMinimum(200)
         self.silence_dur_slider.setMaximum(2000)
@@ -2641,6 +2685,7 @@ class SettingsDialog(QDialog):
         self._cfg["baidu_secret"] = self.baidu_secret_edit.text().strip()
         self._cfg["autostart"] = self.autostart_chk.isChecked()
         self._cfg["close_to_tray"] = self.tray_chk.isChecked()
+        self._cfg["enable_denoiser"] = self.denoiser_chk.isChecked()
         self._cfg["filter_fillers"] = self.filter_filler_chk.isChecked()
         self._cfg["theme"] = self.theme_combo.currentData() or "green"
         self.accept()
@@ -2685,6 +2730,8 @@ class VoiceEngine(QObject):
         self._min_speech_duration = 0.25
         self._max_speech_duration = 30
         self._level = 0.0  # 实时输入电平 (0..1)，UI 音量条轮询用
+        self._enable_denoiser = False  # 识别前降噪（GTCRN）
+        self._denoiser = None
         # 连续模式状态
         self._in_speech = False
 
@@ -2834,6 +2881,7 @@ class VoiceEngine(QObject):
             self.status.emit("正在识别...")
             audio_data = b"".join(self._ptt_buffer)
             samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+            samples = _maybe_denoise(self, samples)
 
             stream = self._recognizer.create_stream()
             stream.accept_waveform(SAMPLE_RATE, samples)
@@ -2917,9 +2965,10 @@ class VoiceEngine(QObject):
         """在后台线程中识别一段语音。"""
         def worker():
             try:
+                samples2 = _maybe_denoise(self, samples)
                 with self._decode_lock:
                     stream = self._recognizer.create_stream()
-                    stream.accept_waveform(SAMPLE_RATE, samples)
+                    stream.accept_waveform(SAMPLE_RATE, samples2)
                     self._recognizer.decode_stream(stream)
                     text = stream.result.text.strip()
                 if _is_real_speech(text):
@@ -2960,6 +3009,7 @@ class MainWindow(QMainWindow):
         self._theme = "green"  # 配色主题
         self._font_size = 10
         self._vad_threshold = 0.02  # 音量阈值（RMS）
+        self._enable_denoiser = False  # 识别前降噪（GTCRN）
         self._min_silence_duration = 0.5
         self._min_speech_duration = 0.25
         self._max_chars = 144
@@ -3470,9 +3520,12 @@ class MainWindow(QMainWindow):
             min_silence=self._min_silence_duration,
             min_speech=self._min_speech_duration,
         )
+        # 降噪开关同步到两个引擎
+        self.voice._enable_denoiser = self._enable_denoiser
         # 悬浮翻译引擎同步音量阈值
         if hasattr(self, "speaker_engine"):
             self.speaker_engine._min_rms = self._vad_threshold
+            self.speaker_engine._enable_denoiser = self._enable_denoiser
 
     def eventFilter(self, obj, event):
         if obj is self.text_input and event.type() == event.KeyPress:
@@ -3772,6 +3825,8 @@ class MainWindow(QMainWindow):
             self.set_autostart(self._autostart)
             # 纯语气词过滤开关（模块级变量，影响识别结果分级）
             self.set_filter_fillers(bool(new_cfg.get("filter_fillers", True)))
+            # 降噪开关
+            self._enable_denoiser = bool(new_cfg.get("enable_denoiser", False))
             # 配色主题
             new_theme = new_cfg.get("theme", "green")
             if new_theme != self._theme:
@@ -3820,6 +3875,7 @@ class MainWindow(QMainWindow):
             "baidu_secret": _obfuscate_secret(self.translator._baidu_secret),
             "autostart": bool(getattr(self, "_autostart", False)),
             "close_to_tray": bool(getattr(self, "_close_to_tray", False)),
+            "enable_denoiser": bool(getattr(self, "_enable_denoiser", False)),
             "speaker_source": self.float_win.source_lang(),
             "speaker_target": self.float_win.target_lang(),
             # 设备下拉未填充（如启动早期）时保留已保存的设备名，避免覆盖丢失
@@ -4657,6 +4713,7 @@ class MainWindow(QMainWindow):
                 self._close_to_tray = bool(cfg.get("close_to_tray", False))
                 self._autostart = bool(cfg.get("autostart", False))
                 self.set_filter_fillers(bool(cfg.get("filter_fillers", True)))
+                self._enable_denoiser = bool(cfg.get("enable_denoiser", False))
                 self._float_geo = cfg.get("float_geo", None)
                 self._saved_window_geo = cfg.get("window_geo", None)
         except Exception:

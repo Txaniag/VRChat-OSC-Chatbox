@@ -4,8 +4,12 @@ dist/
 dist_speaker/
 installer_output/
 backup_20260830/
+_tmp/
 *.exe
 *.zip
 models/
 history.json
 config.json
+hdr.txt
+resp400.html
+up41.json

@@ -7,6 +7,7 @@ datas = [
     ('models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tokens.txt',
      'models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17'),
     ('models/silero_vad.onnx', 'models'),
+    ('models/gtcrn_simple.onnx', 'models'),
     ('app_icon.ico', '.'),
 ]
 binaries = []
