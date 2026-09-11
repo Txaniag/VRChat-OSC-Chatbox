@@ -83,7 +83,7 @@ DENOISER_MODEL = os.path.join(MODEL_DIR, "gtcrn_simple.onnx")
 # 常量
 # ============================================================
 APP_TITLE = "VRChat OSC Chatbox Sender"
-APP_VERSION = "4.4.0"
+APP_VERSION = "4.3.3"
 DEFAULT_IP = "127.0.0.1"
 DEFAULT_PORT = 9000
 MAX_CHARS = 144
@@ -1015,6 +1015,7 @@ def flash_history_item(item, duration=500):
 # 麦克风实时音量条 - 录音时显示输入电平，方便排查"识别不到我说话"
 # ============================================================
 class MicLevelBar(QWidget):
+    thresholdChanged = pyqtSignal(float)  # 拖动阈值箭头 -> 新最低触发音量
     """细长电平条：绿色常态，橙色接近削波，红色削波；带峰值保持标记。
 
     显示值用快攻慢放的追踪平滑（Apple 流体感）：上涨迅速跟手，
@@ -1027,8 +1028,12 @@ class MicLevelBar(QWidget):
         self._disp = 0.0     # 显示电平（平滑追踪）
         self._peak = 0.0
         self._engine = None
-        self.setFixedHeight(10)
-        self.setMinimumWidth(60)
+        self._min_rms = 0.02
+        self._keep_visible = False
+        self._drag = False
+        self.setFixedHeight(16)
+        self.setMinimumWidth(120)
+        self.setToolTip("拖动箭头调整最低触发音量（越右越不敏感）")
         self._timer = QTimer(self)
         self._timer.setInterval(33)  # ~30fps，追帧更顺滑
         self._timer.timeout.connect(self._poll)
@@ -1044,7 +1049,11 @@ class MicLevelBar(QWidget):
     def stop(self):
         self._timer.stop()
         self._engine = None
-        self.setVisible(False)
+        self._disp = 0.0
+        self._peak = 0.0
+        if not self._keep_visible:
+            self.setVisible(False)
+        self.update()
 
     def _poll(self):
         raw = float(getattr(self._engine, "_level", 0.0) or 0.0)
@@ -1082,6 +1091,49 @@ class MicLevelBar(QWidget):
             round(orange.blue() + (red.blue() - orange.blue()) * t),
         )
 
+    @staticmethod
+    def _rms_to_pos(rms):
+        import math as _m
+        db = 20.0 * _m.log10(max(rms, 1e-5))
+        return max(0.0, min(1.0, (db + 45.0) / 45.0))
+
+    @staticmethod
+    def _pos_to_rms(pos):
+        db = pos * 45.0 - 45.0
+        return max(0.001, min(0.1, 10.0 ** (db / 20.0)))
+
+    def set_threshold(self, rms):
+        self._min_rms = max(0.001, min(0.1, float(rms)))
+        self.update()
+
+    def threshold(self):
+        return self._min_rms
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag = True
+            self._apply_pos(event.pos().x())
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag:
+            self._apply_pos(event.pos().x())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag = False
+        super().mouseReleaseEvent(event)
+
+    def _apply_pos(self, x):
+        w = max(1, self.width())
+        pos = max(0.0, min(1.0, x / float(w)))
+        rms = round(self._pos_to_rms(pos), 4)
+        if abs(rms - self._min_rms) > 0.0005:
+            self._min_rms = rms
+            self.setToolTip("最低触发音量: %.3f" % rms)
+            self.update()
+            self.thresholdChanged.emit(rms)
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -1102,6 +1154,13 @@ class MicLevelBar(QWidget):
         if px > 2:
             p.setBrush(QColor(26, 58, 26, 110))
             p.drawRoundedRect(QRectF(px - 1, 1.5, 2, h - 3), 1, 1)
+        # 最低触发音量阈值箭头（可拖动）
+        from PyQt5.QtGui import QPolygonF
+        tp = w * min(1.0, max(0.0, self._rms_to_pos(self._min_rms)))
+        p.setBrush(QColor("#ff9500"))
+        p.drawPolygon(QPolygonF([
+            QPointF(tp - 5, h - 1), QPointF(tp + 5, h - 1), QPointF(tp, h - 9)]))
+        p.drawRoundedRect(QRectF(tp - 1, 2, 2, h - 10), 1, 1)
 
 
 # ============================================================
@@ -1442,7 +1501,7 @@ class SpeakerEngine(QObject):
         self._level = 0.0  # 归一化捕获电平 (0..1)，悬浮窗音量条轮询用
         self._paused = False  # 暂停捕获（跳过切分与识别，仍刷新电平）
         self._min_rms = 0.02  # 音量阈值（RMS），主窗口设置里同步
-        self._enable_denoiser = False  # 识别前降噪（GTCRN）
+        self._enable_denoiser = True  # 识别前降噪（GTCRN）
         self._denoiser = None
         self._reload_busy = False  # 后台重建识别器进行中
         self._tq = queue.Queue(maxsize=8)
@@ -2670,7 +2729,7 @@ class SettingsDialog(QDialog):
         vad_form.addRow("最低触发音量:", vad_threshold_row)
 
         self.denoiser_chk = QCheckBox("识别前降噪（GTCRN）")
-        self.denoiser_chk.setChecked(self._cfg.get("enable_denoiser", False))
+        self.denoiser_chk.setChecked(self._cfg.get("enable_denoiser", True))
         self.denoiser_chk.setToolTip("嘈杂环境下先降噪再识别，能减少误识别；会略微增加识别耗时")
         vad_form.addRow("", self.denoiser_chk)
 
@@ -3478,8 +3537,19 @@ class MainWindow(QMainWindow):
         # 麦克风实时音量条：录音/监听时显示输入电平（排查"识别不到我说话"）
         self.mic_meter = MicLevelBar()
         self.mic_meter.setFixedWidth(150)
-        self.mic_meter.setVisible(False)
+        self.mic_meter._keep_visible = True
+        self.mic_meter.setVisible(True)
+        self.mic_meter.set_threshold(self._vad_threshold)
+        self.mic_meter.thresholdChanged.connect(self._on_min_rms_changed)
         voice_btn_row.addWidget(self.mic_meter)
+        voice_btn_row.addSpacing(8)
+
+        # 识别前降噪（GTCRN）：主页快捷开关，默认开启
+        self.denoiser_home_chk = QCheckBox("识别前降噪")
+        self.denoiser_home_chk.setChecked(self._enable_denoiser)
+        self.denoiser_home_chk.setToolTip("识别前用 GTCRN 降噪，嘈杂环境更稳；高保真录音可关闭")
+        self.denoiser_home_chk.stateChanged.connect(self._on_home_denoiser_toggled)
+        voice_btn_row.addWidget(self.denoiser_home_chk)
         voice_btn_row.addSpacing(10)
 
         self.vad_label = QLabel("")
@@ -3673,6 +3743,16 @@ class MainWindow(QMainWindow):
         """
         # 合并到主样式表
         app.setStyleSheet(STYLE_SHEET + additional)
+
+    def _on_home_denoiser_toggled(self, state):
+        self._enable_denoiser = bool(state)
+        self._apply_vad_params_to_engine()
+        self._save_config()
+
+    def _on_min_rms_changed(self, rms):
+        self._vad_threshold = float(rms)
+        self._apply_vad_params_to_engine()
+        self._save_config()
 
     def _apply_vad_params_to_engine(self):
         self.voice.set_vad_params(
@@ -3989,7 +4069,11 @@ class MainWindow(QMainWindow):
             self._engine_type = new_cfg.get("engine_type", "onnx")
             self.voice.set_engine_type(self._engine_type)
             # 降噪开关
-            self._enable_denoiser = bool(new_cfg.get("enable_denoiser", False))
+            self._enable_denoiser = bool(new_cfg.get("enable_denoiser", True))
+            if hasattr(self, "denoiser_home_chk"):
+                self.denoiser_home_chk.blockSignals(True)
+                self.denoiser_home_chk.setChecked(self._enable_denoiser)
+                self.denoiser_home_chk.blockSignals(False)
             # 配色主题
             new_theme = new_cfg.get("theme", "green")
             if new_theme != self._theme:
@@ -4878,7 +4962,7 @@ class MainWindow(QMainWindow):
                 self._autostart = bool(cfg.get("autostart", False))
                 self.set_filter_fillers(bool(cfg.get("filter_fillers", True)))
                 self._engine_type = cfg.get("engine_type", "onnx")
-                self._enable_denoiser = bool(cfg.get("enable_denoiser", False))
+                self._enable_denoiser = bool(cfg.get("enable_denoiser", True))
                 self._float_geo = cfg.get("float_geo", None)
                 self._saved_window_geo = cfg.get("window_geo", None)
         except Exception:
