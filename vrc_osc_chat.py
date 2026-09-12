@@ -3533,29 +3533,31 @@ class MainWindow(QMainWindow):
         voice_btn_row.addWidget(self.speaker_btn)
 
         voice_btn_row.addStretch()
+        voice_layout.addLayout(voice_btn_row)
 
-        # 麦克风实时音量条：录音/监听时显示输入电平（排查"识别不到我说话"）
+        # 第二行：音量条 + 降噪 + 状态（避免竖屏按钮行过宽截断）
+        voice_opts_row = QHBoxLayout()
         self.mic_meter = MicLevelBar()
         self.mic_meter.setFixedWidth(150)
         self.mic_meter._keep_visible = True
         self.mic_meter.setVisible(True)
         self.mic_meter.set_threshold(self._vad_threshold)
         self.mic_meter.thresholdChanged.connect(self._on_min_rms_changed)
-        voice_btn_row.addWidget(self.mic_meter)
-        voice_btn_row.addSpacing(8)
+        voice_opts_row.addWidget(self.mic_meter)
+        voice_opts_row.addSpacing(8)
 
         # 识别前降噪（GTCRN）：主页快捷开关，默认开启
         self.denoiser_home_chk = QCheckBox("识别前降噪")
         self.denoiser_home_chk.setChecked(self._enable_denoiser)
         self.denoiser_home_chk.setToolTip("识别前用 GTCRN 降噪，嘈杂环境更稳；高保真录音可关闭")
         self.denoiser_home_chk.stateChanged.connect(self._on_home_denoiser_toggled)
-        voice_btn_row.addWidget(self.denoiser_home_chk)
-        voice_btn_row.addSpacing(10)
+        voice_opts_row.addWidget(self.denoiser_home_chk)
+        voice_opts_row.addStretch()
 
         self.vad_label = QLabel("")
         self.vad_label.setObjectName("dimLabel")
-        voice_btn_row.addWidget(self.vad_label, 1)
-        voice_layout.addLayout(voice_btn_row)
+        voice_opts_row.addWidget(self.vad_label, 1)
+        voice_layout.addLayout(voice_opts_row)
 
         self.voice_hint = QLabel("点击「按住说话」手动录音，或「连续监听」自动检测语音端点")
         self.voice_hint.setObjectName("dimLabel")
@@ -3632,12 +3634,12 @@ class MainWindow(QMainWindow):
 
     def _build_portrait(self):
         """竖屏：Bento Grid 单列。"""
-        self.resize(760, 880)
+        self.resize(840, 880)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         outer = QWidget()
         outer_lay = QVBoxLayout(outer)
@@ -3674,7 +3676,7 @@ class MainWindow(QMainWindow):
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
         left_scroll.setFrameShape(QFrame.NoFrame)
-        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         left_widget = QWidget()
         left_scroll.setWidget(left_widget)
         left_layout = QVBoxLayout(left_widget)
