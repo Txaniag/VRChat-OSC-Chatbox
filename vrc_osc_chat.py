@@ -28,6 +28,7 @@ import hashlib
 import random
 import urllib.request
 import urllib.parse
+import socket
 
 import numpy as np
 import pyaudio
@@ -52,6 +53,7 @@ from PyQt5.QtGui import (
     QPixmap, QPen, QCursor
 )
 from pythonosc import udp_client
+from pythonosc.osc_message_builder import OscMessageBuilder
 
 # ============================================================
 # 路径处理
@@ -2089,32 +2091,68 @@ def paint_aurora_background(widget, event):
 
 
 class OSCSender:
+    # Windows: 禁用 UDP 连接重置（ICMP port-unreachable 会让 socket 进入错误态，
+    # 之后所有发送都失败，必须重启接收端/程序才能恢复——这正是“要在 VRChat 里重启 OSC”的根因）
+    _SIO_UDP_CONNRESET = getattr(socket, "SIO_UDP_CONNRESET", 0x9800000C)
+
     def __init__(self):
-        self._client = None
+        self._sock = None
         self._ip = DEFAULT_IP
         self._port = DEFAULT_PORT
 
     def connect(self, ip, port):
         self._ip = ip
         self._port = port
-        self._client = udp_client.SimpleUDPClient(ip, port)
+        self._reset_socket()
 
-    def send_chatbox(self, text, send_immediately=True, notify=False):
-        if self._client is None:
-            self.connect(self._ip, self._port)
+    def _reset_socket(self):
+        """（重新）创建 UDP socket，并禁用 Windows 的 UDP 连接重置。"""
         try:
-            self._client.send_message("/chatbox/input", [text, send_immediately, notify])
-            return True
-        except Exception:
-            return False
-
-    def send_typing(self, is_typing):
-        if self._client is None:
-            return
-        try:
-            self._client.send_message("/chatbox/typing", [is_typing])
+            if self._sock is not None:
+                self._sock.close()
         except Exception:
             pass
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if sys.platform == "win32":
+                try:
+                    s.ioctl(self._SIO_UDP_CONNRESET, 0)
+                except Exception:
+                    pass
+            self._sock = s
+        except Exception:
+            self._sock = None
+
+    def _send(self, address, args):
+        """发送 OSC 消息；失败时重建 socket 重试一次（VRChat 后开 OSC 也能自动恢复）。"""
+        if self._sock is None:
+            self._reset_socket()
+        if self._sock is None:
+            return False
+        try:
+            builder = OscMessageBuilder(address=address)
+            for a in args:
+                builder.add_arg(a)
+            dgram = builder.build().dgram
+            self._sock.sendto(dgram, (self._ip, self._port))
+            return True
+        except Exception:
+            self._reset_socket()
+            if self._sock is None:
+                return False
+            try:
+                self._sock.sendto(dgram, (self._ip, self._port))
+                return True
+            except Exception:
+                return False
+
+    def send_chatbox(self, text, send_immediately=True, notify=False):
+        return self._send("/chatbox/input", [text, send_immediately, notify])
+
+    def send_typing(self, is_typing):
+        if self._sock is None:
+            return
+        self._send("/chatbox/typing", [is_typing])
 
 
 def list_microphones():
