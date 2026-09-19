@@ -94,8 +94,11 @@ function setAutoRestart(v){ autoRestart = !!v; }
     {
         try
         {
-            var opts = new CoreWebView2EnvironmentOptions(
-                "--use-fake-ui-for-media-stream --autoplay-policy=no-user-gesture-required");
+            string args = "--use-fake-ui-for-media-stream --autoplay-policy=no-user-gesture-required";
+            var proxy = DetectProxy();
+            if (!string.IsNullOrEmpty(proxy))
+                args += " --proxy-server=\"" + proxy + "\"";
+            var opts = new CoreWebView2EnvironmentOptions(args);
             var env = await CoreWebView2Environment.CreateAsync(null, null, opts);
             await wv.EnsureCoreWebView2Async(env);
         }
@@ -105,6 +108,67 @@ function setAutoRestart(v){ autoRestart = !!v; }
             exiting = true;
             Application.Exit();
         }
+    }
+
+    // Web Speech 在 WebView2 里走云端识别服务，国内直连会 network 错误，
+    // 自动探测本地代理并让 WebView2 走代理。
+    static string DetectProxy()
+    {
+        try
+        {
+            var env = Environment.GetEnvironmentVariable("EDGE_SPEECH_PROXY");
+            if (!string.IsNullOrWhiteSpace(env)) return env.Trim();
+        }
+        catch { }
+        try
+        {
+            using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Internet Settings"))
+            {
+                if (key != null)
+                {
+                    var enable = key.GetValue("ProxyEnable");
+                    var server = key.GetValue("ProxyServer") as string;
+                    if (Convert.ToInt32(enable ?? 0) == 1 && !string.IsNullOrWhiteSpace(server))
+                    {
+                        var s = server.Trim();
+                        if (s.Contains("="))
+                        {
+                            foreach (var part in s.Split(';'))
+                            {
+                                if (part.StartsWith("https=", StringComparison.OrdinalIgnoreCase) ||
+                                    part.StartsWith("http=", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    s = part.Split(new[] { '=' }, 2)[1];
+                                    break;
+                                }
+                            }
+                        }
+                        if (!s.StartsWith("http")) s = "http://" + s;
+                        return s;
+                    }
+                }
+            }
+        }
+        catch { }
+        foreach (var cand in new[]
+        {
+            "socks5://127.0.0.1:10808", "socks5://127.0.0.1:1080",
+            "http://127.0.0.1:10809", "http://127.0.0.1:7890"
+        })
+        {
+            try
+            {
+                var uri = new Uri(cand);
+                using (var c = new System.Net.Sockets.TcpClient())
+                {
+                    var task = c.ConnectAsync(uri.Host, uri.Port);
+                    if (task.Wait(250) && c.Connected) return cand;
+                }
+            }
+            catch { }
+        }
+        return null;
     }
 
     void OnInit(object sender, CoreWebView2InitializationCompletedEventArgs e)
