@@ -15,3 +15,7 @@ resp400.html
 up41.json
 edge_host/bin/
 edge_host/obj/
+build_tmp/
+dist_speaker_onedir/
+*.bak
+*.bak_before_apple

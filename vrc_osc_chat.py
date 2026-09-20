@@ -18,6 +18,7 @@ import ctypes
 import tempfile
 import subprocess
 import base64
+import html as html_mod
 import webbrowser
 import winreg
 from colorsys import rgb_to_hls, hls_to_rgb
@@ -42,7 +43,7 @@ from PyQt5.QtWidgets import (
     QMessageBox, QComboBox, QRadioButton, QButtonGroup, QScrollArea, QFrame,
     QDialog, QSlider, QSpinBox, QFormLayout, QDialogButtonBox, QSplitter,
     QGraphicsBlurEffect, QGraphicsOpacityEffect, QGraphicsDropShadowEffect,
-    QStyledItemDelegate, QScrollBar, QSystemTrayIcon, QMenu
+    QStyledItemDelegate, QScrollBar, QSystemTrayIcon, QMenu, QStyle
 )
 from PyQt5.QtCore import (
     Qt, QTimer, pyqtSignal, QObject, QPointF, QPoint, QRect, QRectF, QSize,
@@ -51,7 +52,7 @@ from PyQt5.QtCore import (
 )
 from PyQt5.QtGui import (
     QIcon, QPainter, QRadialGradient, QColor, QBrush, QLinearGradient,
-    QPixmap, QPen, QCursor
+    QPixmap, QPen, QCursor, QTextDocument
 )
 from pythonosc import udp_client
 from pythonosc.osc_message_builder import OscMessageBuilder
@@ -86,7 +87,7 @@ DENOISER_MODEL = os.path.join(MODEL_DIR, "gtcrn_simple.onnx")
 # 常量
 # ============================================================
 APP_TITLE = "VRChat OSC Chatbox Sender"
-APP_VERSION = "4.3.3"
+APP_VERSION = "4.4.0"
 DEFAULT_IP = "127.0.0.1"
 DEFAULT_PORT = 9000
 MAX_CHARS = 144
@@ -106,29 +107,30 @@ LANGUAGES = [
     ("粤语", "yue"),
 ]
 
-# Apple 风格主题 - 基于 Apple Human Interface Guidelines
-# 原则: 毛玻璃卡片, 极光背景, Bento Grid, 胶囊按钮, 系统字体
-# 注意: 基础 QWidget 背景必须透明, 否则会盖住主窗口 paintEvent 画的极光
-_STYLE_SHEET_TEMPLATE = """
+# Apple Human Interface Guidelines 主题 (Light / Dark)
+# 原则: 中性色面 (systemGray), 玻璃卡片, 系统蓝 accent,
+#       Bento Grid, 8pt 间距网格, SF Pro / 系统原生字体
+# 注意: 基础 QWidget 背景必须透明, 否则会盖住主窗口 paintEvent 画的壁纸
+_STYLE_LIGHT = """
 QMainWindow {
-    background-color: #f0f8f0;
-    color: #1a3a1a;
+    background-color: #f5f5f7;
+    color: #1d1d1f;
     font-family: -apple-system, "SF Pro Text", "SF Pro", "PingFang SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
     font-size: 10pt;
 }
 QWidget {
     background: transparent;
-    color: #1a3a1a;
+    color: #1d1d1f;
     font-family: -apple-system, "SF Pro Text", "SF Pro", "PingFang SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
     font-size: 10pt;
 }
 QSplitter { background: transparent; }
 QSplitter::handle { background: transparent; }
 
-/* ---- Bento Cards (淡绿毛玻璃) ---- */
+/* ---- Bento Cards (白色玻璃材质, HIG light material) ---- */
 QGroupBox {
-    background-color: rgba(245, 255, 245, 0.88);
-    border: 1px solid rgba(52, 199, 89, 0.12);
+    background-color: rgba(255, 255, 255, 0.72);
+    border: 1px solid rgba(0, 0, 0, 0.1);
     border-radius: 20px;
     margin-top: 6px;
     padding: 42px 14px 14px 14px;
@@ -142,29 +144,30 @@ QGroupBox::title {
     left: 14px;
     top: 14px;
     padding: 0 8px;
-    color: #1a3a1a;
+    color: #1d1d1f;
     font-size: 11pt;
     font-weight: 700;
 }
 
 /* ---- Labels ---- */
-QLabel { background: transparent; color: #1a3a1a; }
-QLabel#dimLabel { color: #6b8f6b; font-size: 9pt; }
+QLabel { background: transparent; color: #1d1d1f; }
+QLabel#dimLabel { color: #6e6e73; font-size: 9pt; }
 QLabel#titleLabel {
-    color: #1a3a1a; font-size: 17pt; font-weight: 700;
-    letter-spacing: -0.02em;
+    color: #1d1d1f; font-size: 17pt; font-weight: 700;
+    letter-spacing: -0.022em;
 }
-QLabel#connOk { color: #2da44e; font-size: 9pt; font-weight: 500; }
+QLabel#connOk { color: #007AFF; font-size: 9pt; font-weight: 500; }
 QLabel#connErr { color: #ff3b30; font-size: 9pt; font-weight: 500; }
+QLabel#oscHint { color: #86868b; font-size: 8pt; }
 QLabel#partialLabel {
-    color: #6b8f6b; font-style: italic; font-size: 9pt;
+    color: #6e6e73; font-style: italic; font-size: 9pt;
     padding: 4px 0;
 }
 QLabel#offlineBadge {
-    color: #2da44e; font-size: 8pt; font-weight: 700;
-    border: 1px solid rgba(45, 164, 78, 0.3); border-radius: 8px;
+    color: #007AFF; font-size: 8pt; font-weight: 700;
+    border: 1px solid rgba(0, 122, 255, 0.3); border-radius: 8px;
     padding: 2px 10px;
-    background: rgba(45, 164, 78, 0.08);
+    background: rgba(0, 122, 255, 0.08);
 }
 QLabel#listeningBadge {
     color: #ff9500; font-size: 8pt; font-weight: 700;
@@ -172,63 +175,63 @@ QLabel#listeningBadge {
     padding: 2px 10px;
     background: rgba(255, 149, 0, 0.08);
 }
-QLabel#vadLevel { color: #2da44e; font-size: 9pt; }
+QLabel#vadLevel { color: #007AFF; font-size: 9pt; }
 
-/* ---- Inputs (无边框, 浅绿背景) ---- */
+/* ---- Inputs (HIG: 中性填充底, 聚焦时蓝色描边) ---- */
 QLineEdit, QTextEdit, QListWidget {
-    background-color: #ebf5eb;
-    color: #1a3a1a;
+    background-color: rgba(0, 0, 0, 0.05);
+    color: #1d1d1f;
     border: 1.5px solid transparent;
     border-radius: 12px;
     padding: 8px 12px;
-    selection-background-color: #34c759;
+    selection-background-color: #007AFF;
     selection-color: #ffffff;
 }
 QLineEdit:focus, QTextEdit:focus, QListWidget:focus {
     background-color: #ffffff;
-    border: 1.5px solid #34c759;
+    border: 1.5px solid #007AFF;
 }
 QLineEdit:disabled, QTextEdit:disabled {
-    background-color: #e4eee4;
-    color: #93ab93;
+    background-color: rgba(0, 0, 0, 0.04);
+    color: #86868b;
     border: 1.5px solid transparent;
 }
 QListWidget {
-    background-color: rgba(245, 255, 245, 0.7);
-    border: 1px solid rgba(52, 199, 89, 0.08);
+    background-color: rgba(255, 255, 255, 0.6);
+    border: 1px solid rgba(0, 0, 0, 0.08);
     border-radius: 12px;
 }
 QListWidget::item {
     border-radius: 8px;
     padding: 4px 8px;
 }
-QListWidget::item:hover { background: rgba(52, 199, 89, 0.06); }
+QListWidget::item:hover { background: rgba(0, 122, 255, 0.08); }
 QListWidget::item:selected {
-    background: rgba(52, 199, 89, 0.12);
-    color: #2da44e;
+    background: rgba(0, 122, 255, 0.15);
+    color: #007AFF;
 }
 
 /* ---- Button Hierarchy ---- */
-/* Secondary (默认) */
+/* Secondary (默认: HIG 灰色填充按钮) */
 QPushButton {
-    background-color: #d4e8d4;
-    color: #1a3a1a;
+    background-color: rgba(0, 0, 0, 0.05);
+    color: #1d1d1f;
     border: none;
     border-radius: 12px;
     padding: 7px 20px;
     font-weight: 600;
     font-size: 10pt;
 }
-QPushButton:hover { background-color: #c0dec0; }
-QPushButton:pressed { background-color: #b0d4b0; }
+QPushButton:hover { background-color: rgba(0, 0, 0, 0.09); }
+QPushButton:pressed { background-color: rgba(0, 0, 0, 0.14); }
 QPushButton:disabled {
-    background-color: #dcecdc;
-    color: #9db89d;
+    background-color: rgba(0, 0, 0, 0.04);
+    color: #b0b0b5;
 }
 
-/* Primary (发送) */
+/* Primary (发送: 系统蓝) */
 QPushButton#sendBtn {
-    background-color: #2da44e;
+    background-color: #007AFF;
     color: #ffffff;
     border: none;
     border-radius: 12px;
@@ -236,35 +239,35 @@ QPushButton#sendBtn {
     font-size: 11pt;
     font-weight: 600;
 }
-QPushButton#sendBtn:hover { background-color: #2cb359; }
-QPushButton#sendBtn:pressed { background-color: #269a45; }
+QPushButton#sendBtn:hover { background-color: #0a84ff; }
+QPushButton#sendBtn:pressed { background-color: #0064d2; }
 QPushButton#sendBtn:disabled {
-    background-color: #c0d4c0;
-    color: #8fb58f;
+    background-color: rgba(0, 0, 0, 0.06);
+    color: #b0b0b5;
 }
 
-/* Mic PTT */
+/* Mic PTT (蓝色淡底) */
 QPushButton#micBtn {
-    background-color: rgba(45, 164, 78, 0.12);
-    color: #1a7a37;
-    border: 1.5px solid rgba(45, 164, 78, 0.3);
+    background-color: rgba(0, 122, 255, 0.12);
+    color: #007AFF;
+    border: 1.5px solid rgba(0, 122, 255, 0.3);
     border-radius: 12px;
     padding: 8px 20px;
     font-size: 10pt;
     font-weight: 600;
 }
 QPushButton#micBtn:hover {
-    background-color: rgba(45, 164, 78, 0.2);
-    border: 1.5px solid rgba(45, 164, 78, 0.5);
+    background-color: rgba(0, 122, 255, 0.2);
+    border: 1.5px solid rgba(0, 122, 255, 0.5);
 }
-QPushButton#micBtn:pressed { background-color: rgba(45, 164, 78, 0.08); }
+QPushButton#micBtn:pressed { background-color: rgba(0, 122, 255, 0.08); }
 QPushButton#micBtn:disabled {
-    color: #b0c8b0;
+    color: #b0b0b5;
     border: 1.5px solid rgba(0, 0, 0, 0.06);
     background: rgba(0, 0, 0, 0.03);
 }
 
-/* Recording */
+/* Recording (系统红) */
 QPushButton#micRecording {
     background-color: #ff3b30;
     color: #ffffff;
@@ -293,7 +296,7 @@ QPushButton#micContinuous:hover {
 }
 QPushButton#micContinuous:pressed { background-color: rgba(255, 149, 0, 0.08); }
 QPushButton#micContinuous:disabled {
-    color: #d4bb9a;
+    color: #b0b0b5;
     border: 1.5px solid rgba(0, 0, 0, 0.06);
     background: rgba(0, 0, 0, 0.03);
 }
@@ -312,30 +315,30 @@ QPushButton#micContinuousActive:pressed { background-color: #e68600; }
 
 /* ComboBox */
 QComboBox {
-    background-color: #ebf5eb;
-    color: #1a3a1a;
+    background-color: rgba(0, 0, 0, 0.05);
+    color: #1d1d1f;
     border: 1.5px solid transparent;
     border-radius: 10px;
     padding: 5px 10px;
     min-width: 70px;
 }
-QComboBox:hover { background-color: #dcecdc; }
-QComboBox:focus { background-color: #ffffff; border: 1.5px solid #34c759; }
-QComboBox:disabled { background-color: #e4eee4; color: #93ab93; }
+QComboBox:hover { background-color: rgba(0, 0, 0, 0.09); }
+QComboBox:focus { background-color: #ffffff; border: 1.5px solid #007AFF; }
+QComboBox:disabled { background-color: rgba(0, 0, 0, 0.04); color: #86868b; }
 QComboBox::drop-down { border: none; width: 22px; }
 QComboBox::down-arrow {
     width: 0; height: 0;
     border-left: 5px solid transparent;
     border-right: 5px solid transparent;
-    border-top: 6px solid #6b8f6b;
+    border-top: 6px solid #6e6e73;
     margin-right: 8px;
 }
 QComboBox QAbstractItemView {
-    background-color: rgba(245, 255, 245, 0.98);
-    color: #1a3a1a;
-    selection-background-color: #2da44e;
+    background-color: rgba(255, 255, 255, 0.98);
+    color: #1d1d1f;
+    selection-background-color: #007AFF;
     selection-color: #ffffff;
-    border: 1px solid rgba(52, 199, 89, 0.12);
+    border: 1px solid rgba(0, 0, 0, 0.12);
     border-radius: 12px;
     outline: none;
     padding: 4px;
@@ -347,81 +350,81 @@ QComboBox QAbstractItemView::item {
 }
 
 /* Checkbox */
-QCheckBox { background: transparent; spacing: 8px; color: #1a3a1a; }
-QCheckBox:disabled { color: #9db89d; }
+QCheckBox { background: transparent; spacing: 8px; color: #1d1d1f; }
+QCheckBox:disabled { color: #b0b0b5; }
 QCheckBox::indicator {
     width: 17px; height: 17px;
-    border-radius: 5px;
-    border: 1.5px solid #b0c8b0;
-    background: #ebf5eb;
+    border-radius: 6px;
+    border: 1.5px solid #c7c7cc;
+    background: #ffffff;
 }
-QCheckBox::indicator:hover { border: 1.5px solid #6b8f6b; }
+QCheckBox::indicator:hover { border: 1.5px solid #6e6e73; }
 QCheckBox::indicator:checked {
-    background-color: #2da44e;
-    border: 1.5px solid #2da44e;
+    background-color: #007AFF;
+    border: 1.5px solid #007AFF;
     image: url(__CHECK_URL__);
 }
 QCheckBox::indicator:disabled {
-    border: 1.5px solid #d4e4d4;
-    background: #e4eee4;
+    border: 1.5px solid #e0e0e5;
+    background: rgba(0, 0, 0, 0.04);
 }
 
 /* Radio */
-QRadioButton { background: transparent; spacing: 8px; color: #1a3a1a; }
+QRadioButton { background: transparent; spacing: 8px; color: #1d1d1f; }
 QRadioButton::indicator {
     width: 17px; height: 17px;
     border-radius: 9px;
-    border: 1.5px solid #b0c8b0;
-    background: #ebf5eb;
+    border: 1.5px solid #c7c7cc;
+    background: #ffffff;
 }
-QRadioButton::indicator:hover { border: 1.5px solid #6b8f6b; }
+QRadioButton::indicator:hover { border: 1.5px solid #6e6e73; }
 QRadioButton::indicator:checked {
     background: #ffffff;
-    border: 5px solid #2da44e;
+    border: 5px solid #007AFF;
 }
 QRadioButton::indicator:disabled {
-    border: 1.5px solid #d4e4d4;
-    background: #e4eee4;
+    border: 1.5px solid #e0e0e5;
+    background: rgba(0, 0, 0, 0.04);
 }
 
 /* Hotkey btn */
 QPushButton#hotkeyBtn {
-    background-color: #ebf5eb;
-    color: #2da44e;
-    border: 1.5px dashed rgba(45, 164, 78, 0.3);
+    background-color: rgba(0, 0, 0, 0.05);
+    color: #007AFF;
+    border: 1.5px dashed rgba(0, 122, 255, 0.4);
     border-radius: 10px;
     padding: 4px 12px;
     font-weight: 600;
     min-width: 70px;
 }
 QPushButton#hotkeyBtn:hover {
-    border: 1.5px dashed rgba(45, 164, 78, 0.6);
-    background-color: rgba(45, 164, 78, 0.05);
+    border: 1.5px dashed rgba(0, 122, 255, 0.7);
+    background-color: rgba(0, 122, 255, 0.05);
 }
 QPushButton#hotkeyBtn:pressed {
-    background-color: rgba(45, 164, 78, 0.1);
+    background-color: rgba(0, 122, 255, 0.1);
 }
 
 /* Settings btn */
 QPushButton#settingsBtn {
-    background-color: rgba(245, 255, 245, 0.7);
-    color: #2da44e;
-    border: 1px solid rgba(52, 199, 89, 0.1);
+    background-color: rgba(255, 255, 255, 0.7);
+    color: #007AFF;
+    border: 1px solid rgba(0, 0, 0, 0.1);
     border-radius: 12px;
     padding: 5px 16px;
     font-weight: 600;
 }
 QPushButton#settingsBtn:hover {
-    background-color: rgba(45, 164, 78, 0.06);
-    border: 1px solid rgba(45, 164, 78, 0.2);
+    background-color: rgba(0, 122, 255, 0.08);
+    border: 1px solid rgba(0, 122, 255, 0.3);
 }
-QPushButton#settingsBtn:pressed { background-color: rgba(45, 164, 78, 0.1); }
+QPushButton#settingsBtn:pressed { background-color: rgba(0, 122, 255, 0.14); }
 
 /* Status bar */
 QStatusBar {
-    background-color: rgba(245, 255, 245, 0.7);
-    color: #6b8f6b;
-    border-top: 1px solid rgba(52, 199, 89, 0.08);
+    background-color: rgba(255, 255, 255, 0.7);
+    color: #6e6e73;
+    border-top: 1px solid rgba(0, 0, 0, 0.08);
     font-size: 9pt;
 }
 QStatusBar::item { border: none; }
@@ -435,69 +438,69 @@ QScrollBar:vertical {
     margin: 4px;
 }
 QScrollBar::handle:vertical {
-    background: rgba(52, 199, 89, 0.2);
+    background: rgba(0, 0, 0, 0.22);
     border-radius: 4px;
     min-height: 30px;
 }
-QScrollBar::handle:vertical:hover { background: rgba(52, 199, 89, 0.35); }
-QScrollBar::handle:vertical:pressed { background: rgba(52, 199, 89, 0.5); }
+QScrollBar::handle:vertical:hover { background: rgba(0, 0, 0, 0.35); }
+QScrollBar::handle:vertical:pressed { background: rgba(0, 0, 0, 0.5); }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar:horizontal { height: 0; }
 
 /* Slider */
 QSlider::groove:horizontal {
-    background: #d4e8d4;
+    background: rgba(0, 0, 0, 0.12);
     height: 6px;
     border-radius: 3px;
 }
 QSlider::sub-page:horizontal {
-    background: #2da44e;
+    background: #007AFF;
     border-radius: 3px;
 }
 QSlider::handle:horizontal {
     background: #ffffff;
     width: 18px; height: 18px;
     border-radius: 9px;
-    border: 1px solid rgba(52, 199, 89, 0.15);
+    border: 1px solid rgba(0, 0, 0, 0.1);
     margin: -6px 0;
 }
 QSlider::handle:horizontal:hover {
-    border: 2px solid #2da44e;
+    border: 2px solid #007AFF;
 }
 
 /* SpinBox */
 QSpinBox {
-    background-color: #ebf5eb;
-    color: #1a3a1a;
+    background-color: rgba(0, 0, 0, 0.05);
+    color: #1d1d1f;
     border: 1.5px solid transparent;
     border-radius: 8px;
     padding: 3px 6px;
 }
-QSpinBox:focus { background-color: #ffffff; border: 1.5px solid #34c759; }
-QSpinBox:disabled { background-color: #e4eee4; color: #93ab93; }
+QSpinBox:focus { background-color: #ffffff; border: 1.5px solid #007AFF; }
+QSpinBox:disabled { background-color: rgba(0, 0, 0, 0.04); color: #86868b; }
 
-/* ---- 悬浮翻译按钮 ---- */
+/* ---- 悬浮翻译按钮 (HIG 系统紫, 与 PTT 蓝区分) ---- */
 QPushButton#speakerBtn {
-    background-color: rgba(53, 132, 228, 0.12);
-    color: #1c6ba0;
-    border: 1.5px solid rgba(53, 132, 228, 0.35);
+    background-color: rgba(88, 86, 214, 0.12);
+    color: #5856d6;
+    border: 1.5px solid rgba(88, 86, 214, 0.35);
     border-radius: 12px;
     padding: 8px 16px;
     font-size: 10pt;
     font-weight: 600;
 }
 QPushButton#speakerBtn:hover {
-    background-color: rgba(53, 132, 228, 0.2);
-    border: 1.5px solid rgba(53, 132, 228, 0.55);
+    background-color: rgba(88, 86, 214, 0.2);
+    border: 1.5px solid rgba(88, 86, 214, 0.55);
 }
-QPushButton#speakerBtn:pressed { background-color: rgba(53, 132, 228, 0.08); }
+QPushButton#speakerBtn:pressed { background-color: rgba(88, 86, 214, 0.08); }
 QPushButton#speakerBtn:disabled {
-    color: #9db4c8;
+    color: #b0b0b5;
     border: 1.5px solid rgba(0, 0, 0, 0.06);
     background: rgba(0, 0, 0, 0.03);
 }
 QPushButton#speakerBtnActive {
-    background-color: #3574e4;
+    background-color: #5856d6;
     color: #ffffff;
     border: none;
     border-radius: 12px;
@@ -505,40 +508,40 @@ QPushButton#speakerBtnActive {
     font-size: 10pt;
     font-weight: 600;
 }
-QPushButton#speakerBtnActive:hover { background-color: #4a83e8; }
-QPushButton#speakerBtnActive:pressed { background-color: #2c66c9; }
+QPushButton#speakerBtnActive:hover { background-color: #6a68e0; }
+QPushButton#speakerBtnActive:pressed { background-color: #4a48c0; }
 
-/* ---- 悬浮翻译窗 (深色玻璃) ---- */
+/* ---- 悬浮翻译窗 (HIG Dark Mode 玻璃) ---- */
 QFrame#floatCard {
-    background-color: rgba(26, 36, 28, 238);
-    border: 1px solid rgba(126, 231, 135, 0.3);
+    background-color: rgba(28, 28, 30, 238);
+    border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 16px;
 }
 QLabel#floatTitle {
-    color: #9fd8ac;
+    color: #f5f5f7;
     font-size: 10pt;
     font-weight: 700;
     background: transparent;
 }
 QLabel#floatStatus {
-    color: #8fae95;
+    color: #98989f;
     font-size: 8pt;
     background: transparent;
 }
 QPushButton#floatBtn {
     background: rgba(255, 255, 255, 0.08);
-    color: #cfe8d4;
+    color: #f5f5f7;
     border: none;
     border-radius: 8px;
     font-family: "Segoe UI Symbol";
     font-size: 9pt;
     padding: 0;
 }
-QPushButton#floatBtn:hover { background-color: rgba(255, 115, 99, 0.85); color: #ffffff; }
+QPushButton#floatBtn:hover { background-color: rgba(255, 69, 58, 0.9); color: #ffffff; }
 QComboBox#floatCombo {
     background-color: rgba(255, 255, 255, 0.09);
-    color: #e8f5ea;
-    border: 1px solid rgba(126, 231, 135, 0.25);
+    color: #f5f5f7;
+    border: 1px solid rgba(255, 255, 255, 0.15);
     border-radius: 8px;
     padding: 2px 6px;
     min-width: 56px;
@@ -550,27 +553,27 @@ QComboBox#floatCombo::down-arrow {
     width: 0; height: 0;
     border-left: 4px solid transparent;
     border-right: 4px solid transparent;
-    border-top: 5px solid #9fd8ac;
+    border-top: 5px solid #d1d1d6;
     margin-right: 4px;
 }
 QTextEdit#floatBody {
     background-color: transparent;
-    color: #eef7ef;
+    color: #f5f5f7;
     border: none;
     font-size: 9pt;
-    selection-background-color: #2da44e;
+    selection-background-color: #0a84ff;
     selection-color: #ffffff;
 }
 
 /* ---- 标题栏 macOS 红绿灯按钮：常显彩色圆点，悬停时符号淡入 ---- */
 QLabel#winTitle {
-    color: #527052;
+    color: #6e6e73;
     font-size: 9pt;
     font-weight: 600;
     letter-spacing: 0.01em;
 }
 QPushButton#tlMin, QPushButton#tlMax, QPushButton#tlClose {
-    background-color: #cfd8cf;
+    background-color: #d1d1d6;
     border: 1px solid rgba(0, 0, 0, 0.08);
     border-radius: 8px;
     color: transparent;
@@ -588,10 +591,10 @@ QPushButton#tlMin:pressed { background-color: #e5a523; }
 QPushButton#tlMax:pressed { background-color: #1fa834; }
 QPushButton#tlClose:pressed { background-color: #e04b43; }
 
-/* Tooltip (Apple 深色胶囊) */
+/* Tooltip (HIG 深色胶囊) */
 QToolTip {
-    background-color: rgba(28, 44, 28, 0.92);
-    color: #f5fff5;
+    background-color: rgba(28, 28, 30, 0.92);
+    color: #f5f5f7;
     border: 1px solid transparent;
     border-radius: 8px;
     padding: 6px 10px;
@@ -599,20 +602,511 @@ QToolTip {
 }
 
 /* Dialog */
-QDialog { background-color: #f0f8f0; }
+QDialog { background-color: #f5f5f7; }
+"""
+
+
+_STYLE_DARK = """
+QMainWindow {
+    background-color: #000000;
+    color: #f5f5f7;
+    font-family: -apple-system, "SF Pro Text", "SF Pro", "PingFang SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
+    font-size: 10pt;
+}
+QWidget {
+    background: transparent;
+    color: #f5f5f7;
+    font-family: -apple-system, "SF Pro Text", "SF Pro", "PingFang SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
+    font-size: 10pt;
+}
+QSplitter { background: transparent; }
+QSplitter::handle { background: transparent; }
+
+/* ---- Bento Cards (深色玻璃材质) ---- */
+QGroupBox {
+    background-color: rgba(28, 28, 30, 0.72);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 20px;
+    margin-top: 6px;
+    padding: 42px 14px 14px 14px;
+    font-weight: 600;
+}
+QGroupBox::title {
+    subcontrol-origin: border;
+    subcontrol-position: top left;
+    left: 14px;
+    top: 14px;
+    padding: 0 8px;
+    color: #f5f5f7;
+    font-size: 11pt;
+    font-weight: 700;
+}
+
+/* ---- Labels ---- */
+QLabel { background: transparent; color: #f5f5f7; }
+QLabel#dimLabel { color: #98989f; font-size: 9pt; }
+QLabel#titleLabel {
+    color: #f5f5f7; font-size: 17pt; font-weight: 700;
+    letter-spacing: -0.022em;
+}
+QLabel#connOk { color: #0a84ff; font-size: 9pt; font-weight: 500; }
+QLabel#connErr { color: #ff453a; font-size: 9pt; font-weight: 500; }
+QLabel#oscHint { color: #8e8e93; font-size: 8pt; }
+QLabel#partialLabel {
+    color: #98989f; font-style: italic; font-size: 9pt;
+    padding: 4px 0;
+}
+QLabel#offlineBadge {
+    color: #0a84ff; font-size: 8pt; font-weight: 700;
+    border: 1px solid rgba(10, 132, 255, 0.32); border-radius: 8px;
+    padding: 2px 10px;
+    background: rgba(10, 132, 255, 0.1);
+}
+QLabel#listeningBadge {
+    color: #ff9f0a; font-size: 8pt; font-weight: 700;
+    border: 1px solid rgba(255, 159, 10, 0.32); border-radius: 8px;
+    padding: 2px 10px;
+    background: rgba(255, 159, 10, 0.1);
+}
+QLabel#vadLevel { color: #0a84ff; font-size: 9pt; }
+
+/* ---- Inputs ---- */
+QLineEdit, QTextEdit, QListWidget {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #f5f5f7;
+    border: 1.5px solid transparent;
+    border-radius: 12px;
+    padding: 8px 12px;
+    selection-background-color: #0a84ff;
+    selection-color: #ffffff;
+}
+QLineEdit:focus, QTextEdit:focus, QListWidget:focus {
+    background-color: rgba(255, 255, 255, 0.13);
+    border: 1.5px solid #0a84ff;
+}
+QLineEdit:disabled, QTextEdit:disabled {
+    background-color: rgba(255, 255, 255, 0.04);
+    color: #8e8e93;
+    border: 1.5px solid transparent;
+}
+QListWidget {
+    background-color: rgba(28, 28, 30, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+}
+QListWidget::item {
+    border-radius: 8px;
+    padding: 4px 8px;
+}
+QListWidget::item:hover { background: rgba(10, 132, 255, 0.12); }
+QListWidget::item:selected {
+    background: rgba(10, 132, 255, 0.22);
+    color: #0a84ff;
+}
+
+/* ---- Buttons ---- */
+QPushButton {
+    background-color: rgba(255, 255, 255, 0.09);
+    color: #f5f5f7;
+    border: none;
+    border-radius: 12px;
+    padding: 7px 20px;
+    font-weight: 600;
+    font-size: 10pt;
+}
+QPushButton:hover { background-color: rgba(255, 255, 255, 0.15); }
+QPushButton:pressed { background-color: rgba(255, 255, 255, 0.21); }
+QPushButton:disabled {
+    background-color: rgba(255, 255, 255, 0.05);
+    color: #6e6e73;
+}
+
+/* Primary (系统蓝 Dark) */
+QPushButton#sendBtn {
+    background-color: #0a84ff;
+    color: #ffffff;
+    border: none;
+    border-radius: 12px;
+    padding: 10px 28px;
+    font-size: 11pt;
+    font-weight: 600;
+}
+QPushButton#sendBtn:hover { background-color: #409cff; }
+QPushButton#sendBtn:pressed { background-color: #0060df; }
+QPushButton#sendBtn:disabled {
+    background-color: rgba(255, 255, 255, 0.06);
+    color: #6e6e73;
+}
+
+/* Mic PTT */
+QPushButton#micBtn {
+    background-color: rgba(10, 132, 255, 0.15);
+    color: #0a84ff;
+    border: 1.5px solid rgba(10, 132, 255, 0.35);
+    border-radius: 12px;
+    padding: 8px 20px;
+    font-size: 10pt;
+    font-weight: 600;
+}
+QPushButton#micBtn:hover {
+    background-color: rgba(10, 132, 255, 0.26);
+    border: 1.5px solid rgba(10, 132, 255, 0.55);
+}
+QPushButton#micBtn:pressed { background-color: rgba(10, 132, 255, 0.1); }
+QPushButton#micBtn:disabled {
+    color: #6e6e73;
+    border: 1.5px solid rgba(255, 255, 255, 0.06);
+    background: rgba(255, 255, 255, 0.03);
+}
+
+/* Recording (Dark 系统红) */
+QPushButton#micRecording {
+    background-color: #ff453a;
+    color: #ffffff;
+    border: none;
+    border-radius: 12px;
+    padding: 8px 20px;
+    font-size: 10pt;
+    font-weight: 600;
+}
+QPushButton#micRecording:hover { background-color: #ff5a50; }
+QPushButton#micRecording:pressed { background-color: #d70015; }
+
+/* Continuous (Dark 系统橙) */
+QPushButton#micContinuous {
+    background-color: rgba(255, 159, 10, 0.15);
+    color: #ff9f0a;
+    border: 1.5px solid rgba(255, 159, 10, 0.35);
+    border-radius: 12px;
+    padding: 8px 20px;
+    font-size: 10pt;
+    font-weight: 600;
+}
+QPushButton#micContinuous:hover {
+    background-color: rgba(255, 159, 10, 0.26);
+    border: 1.5px solid rgba(255, 159, 10, 0.55);
+}
+QPushButton#micContinuous:pressed { background-color: rgba(255, 159, 10, 0.1); }
+QPushButton#micContinuous:disabled {
+    color: #6e6e73;
+    border: 1.5px solid rgba(255, 255, 255, 0.06);
+    background: rgba(255, 255, 255, 0.03);
+}
+QPushButton#micContinuousActive {
+    background-color: #ff9f0a;
+    color: #ffffff;
+    border: none;
+    border-radius: 12px;
+    padding: 8px 20px;
+    font-size: 10pt;
+    font-weight: 600;
+}
+QPushButton#micContinuousActive:hover { background-color: #ffb033; }
+QPushButton#micContinuousActive:pressed { background-color: #e68600; }
+
+/* ComboBox */
+QComboBox {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #f5f5f7;
+    border: 1.5px solid transparent;
+    border-radius: 10px;
+    padding: 5px 10px;
+    min-width: 70px;
+}
+QComboBox:hover { background-color: rgba(255, 255, 255, 0.15); }
+QComboBox:focus { background-color: rgba(255, 255, 255, 0.13); border: 1.5px solid #0a84ff; }
+QComboBox:disabled { background-color: rgba(255, 255, 255, 0.04); color: #8e8993; }
+QComboBox::drop-down { border: none; width: 22px; }
+QComboBox::down-arrow {
+    width: 0; height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid #98989f;
+    margin-right: 8px;
+}
+QComboBox QAbstractItemView {
+    background-color: rgba(44, 44, 46, 0.98);
+    color: #f5f5f7;
+    selection-background-color: #0a84ff;
+    selection-color: #ffffff;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 12px;
+    outline: none;
+    padding: 4px;
+}
+QComboBox QAbstractItemView::item {
+    border-radius: 6px;
+    padding: 4px 8px;
+    min-height: 22px;
+}
+
+/* Checkbox */
+QCheckBox { background: transparent; spacing: 8px; color: #f5f5f7; }
+QCheckBox:disabled { color: #6e6e73; }
+QCheckBox::indicator {
+    width: 17px; height: 17px;
+    border-radius: 6px;
+    border: 1.5px solid #6e6e73;
+    background: rgba(255, 255, 255, 0.08);
+}
+QCheckBox::indicator:hover { border: 1.5px solid #98989f; }
+QCheckBox::indicator:checked {
+    background-color: #0a84ff;
+    border: 1.5px solid #0a84ff;
+    image: url(__CHECK_URL__);
+}
+QCheckBox::indicator:disabled {
+    border: 1.5px solid #48484a;
+    background: rgba(255, 255, 255, 0.04);
+}
+
+/* Radio */
+QRadioButton { background: transparent; spacing: 8px; color: #f5f5f7; }
+QRadioButton::indicator {
+    width: 17px; height: 17px;
+    border-radius: 9px;
+    border: 1.5px solid #6e6e73;
+    background: rgba(255, 255, 255, 0.08);
+}
+QRadioButton::indicator:hover { border: 1.5px solid #98989f; }
+QRadioButton::indicator:checked {
+    background: #0a84ff;
+    border: 4px solid #0a84ff;
+}
+QRadioButton::indicator:disabled {
+    border: 1.5px solid #48484a;
+    background: rgba(255, 255, 255, 0.04);
+}
+
+/* Hotkey btn */
+QPushButton#hotkeyBtn {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #0a84ff;
+    border: 1.5px dashed rgba(10, 132, 255, 0.45);
+    border-radius: 10px;
+    padding: 4px 12px;
+    font-weight: 600;
+    min-width: 70px;
+}
+QPushButton#hotkeyBtn:hover {
+    border: 1.5px dashed rgba(10, 132, 255, 0.75);
+    background-color: rgba(10, 132, 255, 0.08);
+}
+QPushButton#hotkeyBtn:pressed {
+    background-color: rgba(10, 132, 255, 0.15);
+}
+
+/* Settings btn */
+QPushButton#settingsBtn {
+    background-color: rgba(28, 28, 30, 0.7);
+    color: #0a84ff;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    padding: 5px 16px;
+    font-weight: 600;
+}
+QPushButton#settingsBtn:hover {
+    background-color: rgba(10, 132, 255, 0.14);
+    border: 1px solid rgba(10, 132, 255, 0.35);
+}
+QPushButton#settingsBtn:pressed { background-color: rgba(10, 132, 255, 0.22); }
+
+/* Status bar */
+QStatusBar {
+    background-color: rgba(28, 28, 30, 0.7);
+    color: #98989f;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    font-size: 9pt;
+}
+QStatusBar::item { border: none; }
+
+/* Scroll */
+QScrollArea { background-color: transparent; border: none; }
+QScrollBar:vertical {
+    background: transparent;
+    width: 8px;
+    border-radius: 4px;
+    margin: 4px;
+}
+QScrollBar::handle:vertical {
+    background: rgba(255, 255, 255, 0.26);
+    border-radius: 4px;
+    min-height: 30px;
+}
+QScrollBar::handle:vertical:hover { background: rgba(255, 255, 255, 0.4); }
+QScrollBar::handle:vertical:pressed { background: rgba(255, 255, 255, 0.52); }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal { height: 0; }
+
+/* Slider */
+QSlider::groove:horizontal {
+    background: rgba(255, 255, 255, 0.16);
+    height: 6px;
+    border-radius: 3px;
+}
+QSlider::sub-page:horizontal {
+    background: #0a84ff;
+    border-radius: 3px;
+}
+QSlider::handle:horizontal {
+    background: #f5f5f7;
+    width: 18px; height: 18px;
+    border-radius: 9px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    margin: -6px 0;
+}
+QSlider::handle:horizontal:hover {
+    border: 2px solid #0a84ff;
+}
+
+/* SpinBox */
+QSpinBox {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #f5f5f7;
+    border: 1.5px solid transparent;
+    border-radius: 8px;
+    padding: 3px 6px;
+}
+QSpinBox:focus { background-color: rgba(255, 255, 255, 0.13); border: 1.5px solid #0a84ff; }
+QSpinBox:disabled { background-color: rgba(255, 255, 255, 0.04); color: #8e8e93; }
+
+/* ---- 悬浮翻译按钮 (Dark 系统紫) ---- */
+QPushButton#speakerBtn {
+    background-color: rgba(94, 92, 230, 0.18);
+    color: #7d7be8;
+    border: 1.5px solid rgba(94, 92, 230, 0.4);
+    border-radius: 12px;
+    padding: 8px 16px;
+    font-size: 10pt;
+    font-weight: 600;
+}
+QPushButton#speakerBtn:hover {
+    background-color: rgba(94, 92, 230, 0.28);
+    border: 1.5px solid rgba(94, 92, 230, 0.6);
+}
+QPushButton#speakerBtn:pressed { background-color: rgba(94, 92, 230, 0.12); }
+QPushButton#speakerBtn:disabled {
+    color: #6e6e73;
+    border: 1.5px solid rgba(255, 255, 255, 0.06);
+    background: rgba(255, 255, 255, 0.03);
+}
+QPushButton#speakerBtnActive {
+    background-color: #5e5ce6;
+    color: #ffffff;
+    border: none;
+    border-radius: 12px;
+    padding: 8px 16px;
+    font-size: 10pt;
+    font-weight: 600;
+}
+QPushButton#speakerBtnActive:hover { background-color: #7270ec; }
+QPushButton#speakerBtnActive:pressed { background-color: #4a48c0; }
+
+/* ---- 悬浮翻译窗 (Dark Mode 玻璃, 深浅模式下均为深色) ---- */
+QFrame#floatCard {
+    background-color: rgba(22, 22, 24, 240);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 16px;
+}
+QLabel#floatTitle {
+    color: #f5f5f7;
+    font-size: 10pt;
+    font-weight: 700;
+    background: transparent;
+}
+QLabel#floatStatus {
+    color: #98989f;
+    font-size: 8pt;
+    background: transparent;
+}
+QPushButton#floatBtn {
+    background: rgba(255, 255, 255, 0.08);
+    color: #f5f5f7;
+    border: none;
+    border-radius: 8px;
+    font-family: "Segoe UI Symbol";
+    font-size: 9pt;
+    padding: 0;
+}
+QPushButton#floatBtn:hover { background-color: rgba(255, 69, 58, 0.9); color: #ffffff; }
+QComboBox#floatCombo {
+    background-color: rgba(255, 255, 255, 0.09);
+    color: #f5f5f7;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    padding: 2px 6px;
+    min-width: 56px;
+    font-size: 8pt;
+}
+QComboBox#floatCombo:hover { background-color: rgba(255, 255, 255, 0.15); }
+QComboBox#floatCombo::drop-down { border: none; width: 16px; }
+QComboBox#floatCombo::down-arrow {
+    width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #d1d1d6;
+    margin-right: 4px;
+}
+QTextEdit#floatBody {
+    background-color: transparent;
+    color: #f5f5f7;
+    border: none;
+    font-size: 9pt;
+    selection-background-color: #0a84ff;
+    selection-color: #ffffff;
+}
+
+/* ---- 标题栏 ---- */
+QLabel#winTitle {
+    color: #98989f;
+    font-size: 9pt;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+}
+QPushButton#tlMin, QPushButton#tlMax, QPushButton#tlClose {
+    background-color: #48484a;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    color: transparent;
+    font-family: "Segoe UI Symbol";
+    font-size: 7pt;
+    padding: 0;
+}
+QPushButton#tlMin { background-color: #febc2e; }
+QPushButton#tlMax { background-color: #28c840; }
+QPushButton#tlClose { background-color: #ff5f57; }
+QPushButton#tlMin:hover { background-color: #ffcd4a; color: rgba(96, 64, 0, 0.65); }
+QPushButton#tlMax:hover { background-color: #43d95c; color: rgba(0, 70, 15, 0.6); }
+QPushButton#tlClose:hover { background-color: #ff7b74; color: rgba(96, 15, 8, 0.65); }
+QPushButton#tlMin:pressed { background-color: #e5a523; }
+QPushButton#tlMax:pressed { background-color: #1fa834; }
+QPushButton#tlClose:pressed { background-color: #e04b43; }
+
+/* Tooltip */
+QToolTip {
+    background-color: rgba(28, 28, 30, 0.94);
+    color: #f5f5f7;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 9pt;
+}
+
+/* Dialog */
+QDialog { background-color: #1c1c1e; }
 """
 
 
 # 下拉弹层视图专用样式：挂视图自身，保证透明容器下圆角/选中样式稳定
-POPUP_VIEW_QSS = """
+POPUP_LIGHT = """
 QListView {
-    background-color: rgba(248, 253, 248, 0.99);
-    color: #1a3a1a;
-    border: 1px solid rgba(52, 199, 89, 0.28);
+    background-color: rgba(255, 255, 255, 0.99);
+    color: #1d1d1f;
+    border: 1px solid rgba(0, 0, 0, 0.15);
     border-radius: 12px;
     outline: none;
     padding: 6px;
-    selection-background-color: #2da44e;
+    selection-background-color: #007AFF;
     selection-color: #ffffff;
 }
 QListView::item {
@@ -622,8 +1116,31 @@ QListView::item {
     min-height: 22px;
     background: transparent;
 }
-QListView::item:hover { background: rgba(52, 199, 89, 0.15); }
-QListView::item:selected { background: #2da44e; color: #ffffff; }
+QListView::item:hover { background: rgba(0, 122, 255, 0.15); }
+QListView::item:selected { background: #007AFF; color: #ffffff; }
+"""
+
+
+POPUP_DARK = """
+QListView {
+    background-color: rgba(44, 44, 46, 0.99);
+    color: #f5f5f7;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 12px;
+    outline: none;
+    padding: 6px;
+    selection-background-color: #0a84ff;
+    selection-color: #ffffff;
+}
+QListView::item {
+    border-radius: 8px;
+    padding: 5px 10px;
+    margin: 1px 2px;
+    min-height: 22px;
+    background: transparent;
+}
+QListView::item:hover { background: rgba(10, 132, 255, 0.2); }
+QListView::item:selected { background: #0a84ff; color: #ffffff; }
 """
 
 
@@ -655,43 +1172,140 @@ _CHECK_PNG = _ensure_check_png()
 
 
 # ============================================================
-# 配色主题 - 预设色板，清新绿为默认（排第一）
-# 原理：模板硬编码的是绿色系，其它主题对整个绿色系做色相偏移，
-# 保持明度/饱和度结构不变，得到协调的同系配色
+# 配色主题 - HIG 系统色，苹果蓝为默认（排第一）
+# 原理：模板硬编码的是系统蓝 accent 家族，其它主题对 accent
+# 家族做色相偏移，明度/饱和度结构不变；中性灰面与语义色不动
 # ============================================================
-# 需要随主题变化的绿色系 hex（模板与代码里的绿色字面量）
-_GREEN_HEX = [
-    "#f0f8f0", "#1a3a1a", "#6b8f6b", "#527052",
-    "#2da44e", "#34c759", "#1a7a37", "#2cb359", "#269a45",
-    "#ebf5eb", "#e4eee4", "#93ab93", "#d4e8d4", "#c0dec0",
-    "#b0d4b0", "#dcecdc", "#9db89d", "#b0c8b0", "#c0d4c0",
-    "#8fb58f", "#d4e4d4", "#9fd8ac", "#8fae95", "#cfe8d4",
-    "#e8f5ea", "#eef7ef", "#f5fff5", "#7ee787", "#7fa387",
-    "#3a4a3c",
+# 浅色模板 accent 家族（随主题色相偏移）
+_ACCENT_HEX_LIGHT = ["#007AFF", "#0a84ff", "#0064d2"]
+_ACCENT_RGB_LIGHT = ["0, 122, 255"]
+# 深色模板 accent 家族
+_ACCENT_HEX_DARK = ["#0a84ff", "#409cff", "#0060df"]
+_ACCENT_RGB_DARK = ["10, 132, 255"]
+
+# 壁纸（底色 + 4 个弥散光球）
+_WALLPAPER_LIGHT = [
+    (245, 245, 247), (92, 150, 255), (255, 150, 182), (178, 142, 255),
+    (110, 215, 225),
 ]
-# 需要随主题变化的绿色系 rgb 三元组（出现在 rgba(...) 里）
-_GREEN_RGB = [
-    "245, 255, 245", "248, 253, 248", "45, 164, 78",
-    "52, 199, 89", "126, 231, 135",
-]
-# 极光背景色（底色 + 3 个光球）
-_AURORA_GREEN = [
-    (240, 248, 240), (120, 200, 130), (100, 220, 180), (180, 220, 100),
+_WALLPAPER_DARK = [
+    (16, 16, 20), (36, 80, 158), (148, 60, 100), (86, 66, 156),
+    (34, 116, 126),
 ]
 
 THEMES = {
-    "green":  {"name": "清新绿", "accent": "#2da44e"},
-    "blue":   {"name": "天空蓝", "accent": "#0a84ff"},
-    "purple": {"name": "薰衣草", "accent": "#5856d6"},
-    "teal":   {"name": "青碧",   "accent": "#00a6a0"},
-    "orange": {"name": "珊瑚橙", "accent": "#ff7a1a"},
+    "apple":  {"name": "苹果蓝", "accent": "#007AFF"},
+    "purple": {"name": "薰衣草紫", "accent": "#5856d6"},
     "pink":   {"name": "玫瑰粉", "accent": "#ff2d55"},
+    "orange": {"name": "珊瑚橙", "accent": "#ff9500"},
+    "green":  {"name": "薄荷绿", "accent": "#34c759"},
+    "teal":   {"name": "青碧",   "accent": "#00c7be"},
 }
 
-CURRENT_THEME = "green"
+# 外观模式：system / light / dark
+APPEARANCES = {
+    "system": "跟随系统",
+    "light":  "浅色",
+    "dark":   "深色",
+}
+
+CURRENT_THEME = "apple"
+CURRENT_APPEARANCE = "light"  # 当前实际生效外观（system 解析后的结果）
 # 当前主题的强调色（供电平条/历史闪光等代码读取）
-CURRENT_ACCENT_HEX = "#2da44e"
-CURRENT_ACCENT_RGB = (52, 199, 89)
+CURRENT_ACCENT_HEX = "#007AFF"
+CURRENT_ACCENT_RGB = (0, 122, 255)
+
+
+def system_appearance():
+    """检测 Windows 系统深浅色：读注册表 AppsUseLightTheme。"""
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        )
+        val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        winreg.CloseKey(key)
+        return "light" if val else "dark"
+    except Exception:
+        return "light"
+
+
+def resolve_appearance(mode):
+    """system 模式解析为实际 light/dark。"""
+    if mode == "system":
+        return system_appearance()
+    if mode in ("light", "dark"):
+        return mode
+    return "light"
+
+
+# ============================================================
+# Win10/11 Acrylic 真玻璃背景（SetWindowCompositionAttribute）
+# 成功后窗口透明，DWM 实时模糊桌面；失败则回退到自绘壁纸
+# ============================================================
+class _AccentPolicy(ctypes.Structure):
+    _fields_ = [
+        ("AccentState", ctypes.c_uint),
+        ("AccentFlags", ctypes.c_uint),
+        ("GradientColor", ctypes.c_uint),
+        ("AnimationId", ctypes.c_uint),
+    ]
+
+
+class _WindowCompositionAttrData(ctypes.Structure):
+    _fields_ = [
+        ("Attribute", ctypes.c_int),
+        ("Data", ctypes.c_void_p),
+        ("SizeOfData", ctypes.c_size_t),
+    ]
+
+
+def enable_acrylic(window, appearance):
+    """为窗口启用 Acrylic；返回 True/False。"""
+    if sys.platform != "win32":
+        return False
+    try:
+        set_attr = getattr(ctypes.windll.user32, "SetWindowCompositionAttribute", None)
+        if set_attr is None:
+            return False
+        # GradientColor: AABBGGRR，alpha 是色调层强度
+        if appearance == "dark":
+            gradient = 0x9C141418
+        else:
+            gradient = 0x8CF5F5F7
+        accent = _AccentPolicy()
+        accent.AccentState = 4          # ACCENT_ENABLE_ACRYLICBLURBEHIND
+        accent.AccentFlags = 2          # 绘制全部边
+        accent.GradientColor = gradient
+        data = _WindowCompositionAttrData()
+        data.Attribute = 19             # WCA_ACCENT_POLICY
+        data.SizeOfData = ctypes.sizeof(accent)
+        data.Data = ctypes.cast(ctypes.pointer(accent), ctypes.c_void_p).value
+        hwnd = int(window.winId())
+        ok = set_attr(hwnd, ctypes.byref(data))
+        if not ok:
+            return False
+        window.setAttribute(Qt.WA_TranslucentBackground, True)
+        window._acrylic_ok = True
+        return True
+    except Exception:
+        return False
+
+
+def apply_dark_titlebar(widget, dark):
+    """让原生标题栏跟随深色/浅色（Win10 2004+ / Win11）；失败静默。"""
+    if sys.platform != "win32":
+        return
+    try:
+        hwnd = int(widget.winId())
+        val = ctypes.c_int(1 if dark else 0)
+        dwm = ctypes.windll.dwmapi
+        # 20 = DWMWA_USE_IMMERSIVE_DARK_MODE（更早的内部版本号为 19）
+        dwm.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(val), ctypes.sizeof(val))
+        dwm.DwmSetWindowAttribute(hwnd, 19, ctypes.byref(val), ctypes.sizeof(val))
+    except Exception:
+        pass
 
 
 def _hex2hls(hexv):
@@ -729,24 +1343,40 @@ def _shift_rgb(rgbstr, dh):
 
 
 def _theme_hue_shift(theme_id):
-    """相对默认绿色主题的色相偏移量。"""
-    gh, _, _ = _hex2hls(THEMES["green"]["accent"])
-    th, _, _ = _hex2hls(THEMES.get(theme_id, THEMES["green"])["accent"])
-    return th - gh
+    """相对默认苹果蓝主题的色相偏移量。"""
+    ah, _, _ = _hex2hls(THEMES["apple"]["accent"])
+    th, _, _ = _hex2hls(THEMES.get(theme_id, THEMES["apple"])["accent"])
+    return th - ah
 
 
-def build_stylesheet(theme_id):
-    """按主题构建主样式表和弹层样式表。"""
+def _hue_replace(text, values, dh, is_hex):
+    """对一组 hex/rgb 统一做色相偏移；两阶段占位替换避免连锁替换。"""
+    if abs(dh) <= 1e-9:
+        return text
+    tokens = {}
+    for i, v in enumerate(values):
+        nv = _shift_hex(v, dh) if is_hex else _shift_rgb(v, dh)
+        tok = f"\x00H{i}\x00"
+        text = text.replace(v, tok)
+        tokens[tok] = nv
+    for tok, nv in tokens.items():
+        text = text.replace(tok, nv)
+    return text
+
+
+def build_stylesheet(theme_id, appearance):
+    """按主题与实际外观构建主样式表和弹层样式表。"""
     dh = _theme_hue_shift(theme_id)
-    sheet = _STYLE_SHEET_TEMPLATE
-    popup = POPUP_VIEW_QSS
-    if dh != 0.0:
-        for h in _GREEN_HEX:
-            sheet = sheet.replace(h, _shift_hex(h, dh))
-            popup = popup.replace(h, _shift_hex(h, dh))
-        for rgb in _GREEN_RGB:
-            sheet = sheet.replace(rgb, _shift_rgb(rgb, dh))
-            popup = popup.replace(rgb, _shift_rgb(rgb, dh))
+    if appearance == "dark":
+        sheet, popup = _STYLE_DARK, POPUP_DARK
+        hexes, rgbs = _ACCENT_HEX_DARK, _ACCENT_RGB_DARK
+    else:
+        sheet, popup = _STYLE_LIGHT, POPUP_LIGHT
+        hexes, rgbs = _ACCENT_HEX_LIGHT, _ACCENT_RGB_LIGHT
+    sheet = _hue_replace(sheet, hexes, dh, True)
+    popup = _hue_replace(popup, hexes, dh, True)
+    sheet = _hue_replace(sheet, rgbs, dh, False)
+    popup = _hue_replace(popup, rgbs, dh, False)
     if _CHECK_PNG:
         sheet = sheet.replace("__CHECK_URL__", _CHECK_PNG)
     else:
@@ -754,30 +1384,27 @@ def build_stylesheet(theme_id):
     return sheet, popup
 
 
-def aurora_colors(theme_id):
-    """按主题返回极光底色 + 3 个光球颜色。"""
-    dh = _theme_hue_shift(theme_id)
-    out = []
-    for (r, g, b) in _AURORA_GREEN:
-        h, l, s = rgb_to_hls(r / 255.0, g / 255.0, b / 255.0)
-        nr, ng, nb = hls_to_rgb((h + dh) % 1.0, l, s)
-        out.append((int(round(nr * 255)), int(round(ng * 255)), int(round(nb * 255))))
-    return out
+def aurora_colors(theme_id, appearance):
+    """返回对应外观的壁纸底色 + 4 个弥散光球颜色（多色固定）。"""
+    if appearance == "dark":
+        return list(_WALLPAPER_DARK)
+    return list(_WALLPAPER_LIGHT)
 
 
-def apply_theme(theme_id):
-    """切换主题：重建样式表并更新模块级强调色，返回 (sheet, popup)。"""
-    global CURRENT_THEME, CURRENT_ACCENT_HEX, CURRENT_ACCENT_RGB
-    CURRENT_THEME = theme_id if theme_id in THEMES else "green"
-    dh = _theme_hue_shift(CURRENT_THEME)
-    # 强调色与样式表完全一致：默认 #2da44e 做色相偏移（绿色主题原样，其它主题同构偏移）
-    CURRENT_ACCENT_HEX = _shift_hex("#2da44e", dh)
-    # 强调亮色 #34c759（电平条轨道/闪光/弹窗边框）随主题色相偏移后转 rgb
-    CURRENT_ACCENT_RGB = _hex2rgb(_shift_hex("#34c759", dh))
-    return build_stylesheet(CURRENT_THEME)
+def apply_theme(theme_id, appearance_mode="system"):
+    """切换主题/外观：重建样式表并更新模块级状态，返回 (sheet, popup)。"""
+    global CURRENT_THEME, CURRENT_APPEARANCE, CURRENT_ACCENT_HEX, CURRENT_ACCENT_RGB
+    CURRENT_THEME = theme_id if theme_id in THEMES else "apple"
+    appearance_mode = appearance_mode if appearance_mode in APPEARANCES else "system"
+    CURRENT_APPEARANCE = resolve_appearance(appearance_mode)
+    # 强调色与 QSS 完全一致：从对应外观的基准蓝做同样的色相偏移
+    base_hex = "#0a84ff" if CURRENT_APPEARANCE == "dark" else "#007AFF"
+    CURRENT_ACCENT_HEX = _shift_hex(base_hex, _theme_hue_shift(CURRENT_THEME))
+    CURRENT_ACCENT_RGB = _hex2rgb(CURRENT_ACCENT_HEX)
+    return build_stylesheet(CURRENT_THEME, CURRENT_APPEARANCE)
 
 
-STYLE_SHEET, POPUP_VIEW_QSS_THEMED = apply_theme(CURRENT_THEME)
+STYLE_SHEET, POPUP_VIEW_QSS_THEMED = apply_theme(CURRENT_THEME, "system")
 
 
 # ============================================================
@@ -1155,7 +1782,7 @@ class MicLevelBar(QWidget):
         # 峰值标记
         px = w * min(1.0, self._peak)
         if px > 2:
-            p.setBrush(QColor(26, 58, 26, 110))
+            p.setBrush(QColor(255, 255, 255, 170))
             p.drawRoundedRect(QRectF(px - 1, 1.5, 2, h - 3), 1, 1)
         # 最低触发音量阈值箭头（可拖动）
         from PyQt5.QtGui import QPolygonF
@@ -1961,18 +2588,18 @@ class FloatingTranslateWindow(QWidget):
         if translated:
             tesc = translated.replace("&", "&amp;").replace("<", "&lt;")
             block = (
-                f'<span style="color:#7fa387;font-size:8pt;">{stamp}</span><br>'
-                f'<span style="color:#eef7ef;">{esc}</span><br>'
-                f'<span style="color:#7ee787;">{tesc}</span>'
+                f'<span style="color:#98989f;font-size:8pt;">{stamp}</span><br>'
+                f'<span style="color:#f5f5f7;">{esc}</span><br>'
+                f'<span style="color:#0a84ff;">{tesc}</span>'
             )
         else:
             block = (
-                f'<span style="color:#7fa387;font-size:8pt;">{stamp}</span><br>'
-                f'<span style="color:#eef7ef;">{esc}</span><br>'
+                f'<span style="color:#98989f;font-size:8pt;">{stamp}</span><br>'
+                f'<span style="color:#f5f5f7;">{esc}</span><br>'
                 f'<span style="color:#ffb46b;">（翻译失败，仅显示原文）</span>'
             )
         self.body.append(block)
-        self.body.append("<span style=\"color:#3a4a3c;\">—</span>")
+        self.body.append("<span style=\"color:#48484a;\">—</span>")
         self._pending_original = None
         self.status_label.setText("正在监听扬声器...")
         sb = self.body.verticalScrollBar()
@@ -2030,7 +2657,10 @@ class FloatingTranslateWindow(QWidget):
 # 历史列表换行代理 - 长条目自动换行，不再被硬裁剪
 # ============================================================
 class HistoryListDelegate(QStyledItemDelegate):
-    """历史条目按列表宽度自动换行（最多 max_lines 行），完整内容走 tooltip。"""
+    """历史条目：时间戳灰色、正文深色，按宽度自动换行（最多 max_lines 行），
+    条目底部画细分隔线，完整内容走 tooltip。"""
+
+    _TS_RE = re.compile(r'^(\[\d{1,2}:\d{2}:\d{2}\]\s*)')
 
     def __init__(self, view, max_lines=4):
         super().__init__(view)
@@ -2045,14 +2675,59 @@ class HistoryListDelegate(QStyledItemDelegate):
         line_h = fm.height()
         lines = max(1, round(rect.height() / line_h))
         h = min(lines, self._max_lines) * line_h
-        return QSize(vw + 12, h + 10)
+        return QSize(vw + 12, h + 14)
+
+    def paint(self, painter, option, index):
+        text = index.data(Qt.DisplayRole) or ""
+        selected = bool(option.state & QStyle.State_Selected)
+        dark = CURRENT_APPEARANCE == "dark"
+
+        painter.save()
+        # 条目背景（含 QSS 的 hover/选中底色）
+        style = option.widget.style() if option.widget is not None else QApplication.style()
+        style.drawPrimitive(QStyle.PE_PanelItemViewItem, option, painter, option.widget)
+
+        body_default = "#f5f5f7" if dark else "#1d1d1f"
+        ts_default = "#8e8e93" if dark else "#86868b"
+        if m := self._TS_RE.match(text):
+            ts = html_mod.escape(m.group(1))
+            body = html_mod.escape(text[m.end():])
+            if selected:
+                ts_color = "rgba(255,255,255,0.65)" if dark else "rgba(0,122,255,0.55)"
+                body_color = CURRENT_ACCENT_HEX
+            else:
+                ts_color, body_color = ts_default, body_default
+            rich = f'<span style="color:{ts_color};">{ts}</span><span style="color:{body_color};">{body}</span>'
+        else:
+            body_color = CURRENT_ACCENT_HEX if selected else body_default
+            rich = f'<span style="color:{body_color};">{html_mod.escape(text)}</span>'
+
+        vw = option.rect.width() - 20
+        doc = QTextDocument()
+        doc.setDocumentMargin(0)
+        doc.setDefaultFont(option.font)
+        doc.setHtml(rich)
+        doc.setTextWidth(max(10, vw))
+
+        painter.translate(option.rect.left() + 10, option.rect.top() + 6)
+        painter.setClipRect(QRectF(0, 0, vw, option.rect.height() - 12))
+        doc.drawContents(painter)
+        painter.restore()
+
+        # 条目分隔线（HIG 发丝线，深浅各一套）
+        painter.save()
+        line_c = QColor(255, 255, 255, 28) if dark else QColor(0, 0, 0, 24)
+        painter.setPen(QPen(line_c))
+        y = option.rect.bottom() - 1
+        painter.drawLine(option.rect.left() + 10, y, option.rect.right() - 10, y)
+        painter.restore()
 
 
 # ============================================================
-# 淡绿色极光背景 - 直接在主窗口 paintEvent 绘制
+# macOS 风格多色壁纸 - 直接在主窗口 paintEvent 绘制
 # ============================================================
 def paint_aurora_background(widget, event):
-    """在主窗口背景上绘制淡色弥散光球（颜色随主题变化）。"""
+    """在主窗口背景上绘制 macOS 风格的多色弥散光球壁纸。"""
     painter = QPainter(widget)
     painter.setRenderHint(QPainter.Antialiasing)
 
@@ -2060,35 +2735,49 @@ def paint_aurora_background(widget, event):
     if w == 0 or h == 0:
         return
 
-    # 当前主题的极光配色（底色 + 3 光球）
-    base, b1, b2, b3 = aurora_colors(CURRENT_THEME)
+    # 壁纸配色（底色 + 4 个弥散光球）
+    acrylic = getattr(widget, "_acrylic_ok", False)
+    colors = aurora_colors(CURRENT_THEME, CURRENT_APPEARANCE)
+    base = colors[0]
+    b1, b2, b3, b4 = colors[1], colors[2], colors[3], colors[4]
+    # Acrylic 下底色由 DWM 提供，光球只作淡彩点缀
+    k = 0.5 if acrylic else 1.0
 
-    # 底色
-    painter.fillRect(event.rect(), QColor(base[0], base[1], base[2]))
+    # 底色（Acrylic 下不画，保持透明以露出实时模糊）
+    if not acrylic:
+        painter.fillRect(event.rect(), QColor(base[0], base[1], base[2]))
+    painter.setPen(Qt.NoPen)
 
-    # 光球 1: 左上
-    c1 = QRadialGradient(w * 0.15, h * 0.15, max(w, h) * 0.5)
-    c1.setColorAt(0, QColor(b1[0], b1[1], b1[2], 80))
-    c1.setColorAt(0.5, QColor(b1[0], b1[1], b1[2], 30))
+    # 光球 1: 左上 (蓝)
+    c1 = QRadialGradient(w * 0.12, h * 0.12, max(w, h) * 0.55)
+    c1.setColorAt(0, QColor(b1[0], b1[1], b1[2], int(105 * k)))
+    c1.setColorAt(0.5, QColor(b1[0], b1[1], b1[2], int(40 * k)))
     c1.setColorAt(1, QColor(b1[0], b1[1], b1[2], 0))
     painter.setBrush(QBrush(c1))
-    painter.setPen(Qt.NoPen)
-    painter.drawEllipse(QPointF(w * 0.15, h * 0.15), w * 0.55, h * 0.55)
+    painter.drawEllipse(QPointF(w * 0.12, h * 0.12), w * 0.55, h * 0.55)
 
-    # 光球 2: 右下
-    c2 = QRadialGradient(w * 0.85, h * 0.8, max(w, h) * 0.5)
-    c2.setColorAt(0, QColor(b2[0], b2[1], b2[2], 60))
-    c2.setColorAt(0.5, QColor(b2[0], b2[1], b2[2], 20))
+    # 光球 2: 右下 (粉)
+    c2 = QRadialGradient(w * 0.88, h * 0.85, max(w, h) * 0.55)
+    c2.setColorAt(0, QColor(b2[0], b2[1], b2[2], int(85 * k)))
+    c2.setColorAt(0.5, QColor(b2[0], b2[1], b2[2], int(30 * k)))
     c2.setColorAt(1, QColor(b2[0], b2[1], b2[2], 0))
     painter.setBrush(QBrush(c2))
-    painter.drawEllipse(QPointF(w * 0.85, h * 0.8), w * 0.5, h * 0.5)
+    painter.drawEllipse(QPointF(w * 0.88, h * 0.85), w * 0.52, h * 0.52)
 
-    # 光球 3: 中上
-    c3 = QRadialGradient(w * 0.6, h * 0.3, max(w, h) * 0.35)
-    c3.setColorAt(0, QColor(b3[0], b3[1], b3[2], 40))
+    # 光球 3: 中上 (紫)
+    c3 = QRadialGradient(w * 0.62, h * 0.25, max(w, h) * 0.4)
+    c3.setColorAt(0, QColor(b3[0], b3[1], b3[2], int(70 * k)))
     c3.setColorAt(1, QColor(b3[0], b3[1], b3[2], 0))
     painter.setBrush(QBrush(c3))
-    painter.drawEllipse(QPointF(w * 0.6, h * 0.3), w * 0.35, h * 0.35)
+    painter.drawEllipse(QPointF(w * 0.62, h * 0.25), w * 0.38, h * 0.38)
+
+    # 光球 4: 底部偏左 (青)
+    c4 = QRadialGradient(w * 0.32, h * 0.95, max(w, h) * 0.45)
+    c4.setColorAt(0, QColor(b4[0], b4[1], b4[2], int(75 * k)))
+    c4.setColorAt(0.6, QColor(b4[0], b4[1], b4[2], int(25 * k)))
+    c4.setColorAt(1, QColor(b4[0], b4[1], b4[2], 0))
+    painter.setBrush(QBrush(c4))
+    painter.drawEllipse(QPointF(w * 0.32, h * 0.95), w * 0.42, h * 0.42)
 
 
 class OSCSender:
@@ -2658,6 +3347,8 @@ class SettingsDialog(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
+        # 原生标题栏跟随当前外观（深色内容配深色标题栏）
+        apply_dark_titlebar(self, CURRENT_APPEARANCE == "dark")
         # 偶发操作的模态弹窗：200ms 淡入 + 12px 上浮（modal 居中，不做缩放原点）
         if not getattr(self, "_entered", False):
             self._entered = True
@@ -2720,13 +3411,25 @@ class SettingsDialog(QDialog):
         self.theme_combo = AnimatedComboBox()
         for tid, tinfo in THEMES.items():
             self.theme_combo.addItem(tinfo["name"], tid)
-        cur_theme = self._cfg.get("theme", "green")
+        cur_theme = self._cfg.get("theme", "apple")
         for i in range(self.theme_combo.count()):
             if self.theme_combo.itemData(i) == cur_theme:
                 self.theme_combo.setCurrentIndex(i)
                 break
-        self.theme_combo.setToolTip("切换整体配色（按钮、焦点、极光背景等）")
+        self.theme_combo.setToolTip("切换整体强调色（按钮、焦点、选中态等）")
         layout_form.addRow("配色主题:", self.theme_combo)
+
+        # 外观模式（跟随系统 / 浅色 / 深色）
+        self.appearance_combo = AnimatedComboBox()
+        for aid, aname in APPEARANCES.items():
+            self.appearance_combo.addItem(aname, aid)
+        cur_appearance = self._cfg.get("appearance", "system")
+        for i in range(self.appearance_combo.count()):
+            if self.appearance_combo.itemData(i) == cur_appearance:
+                self.appearance_combo.setCurrentIndex(i)
+                break
+        self.appearance_combo.setToolTip("跟随 Windows 系统深浅色，或手动指定")
+        layout_form.addRow("外观模式:", self.appearance_combo)
 
         # 行为选项
         self.autostart_chk = QCheckBox("开机自动启动")
@@ -2885,7 +3588,8 @@ class SettingsDialog(QDialog):
         self._cfg["close_to_tray"] = self.tray_chk.isChecked()
         self._cfg["enable_denoiser"] = self.denoiser_chk.isChecked()
         self._cfg["filter_fillers"] = self.filter_filler_chk.isChecked()
-        self._cfg["theme"] = self.theme_combo.currentData() or "green"
+        self._cfg["theme"] = self.theme_combo.currentData() or "apple"
+        self._cfg["appearance"] = self.appearance_combo.currentData() or "system"
         self.accept()
 
     def get_config(self):
@@ -3245,7 +3949,8 @@ class MainWindow(QMainWindow):
         self._hotkey_key_down = False  # 防止按键自动重复触发
         # 布局和设置参数
         self._layout_mode = "portrait"  # "portrait" or "landscape"
-        self._theme = "green"  # 配色主题
+        self._theme = "apple"  # 配色主题
+        self._appearance = "system"  # 外观模式 system/light/dark
         self._engine_type = "onnx"  # 识别引擎：onnx 离线 / edge 在线
         self._font_size = 10
         self._vad_threshold = 0.02  # 音量阈值（RMS）
@@ -3281,9 +3986,8 @@ class MainWindow(QMainWindow):
         self.translateFinished.connect(self._on_translate_finished)
         self._create_widgets()
         self._load_config()
-        # 非默认主题：加载后立即应用（_apply_font_size 会用主题样式表）
-        if self._theme != "green":
-            self._apply_theme(self._theme)
+        # 加载后立即应用主题与外观（_apply_font_size 会用对应样式表）
+        self._apply_theme(self._theme, self._appearance)
         self._apply_layout()
 
         self.voice.partialResult.connect(self._on_partial)
@@ -3327,6 +4031,26 @@ class MainWindow(QMainWindow):
         self._setup_tray()
         # 静默检查更新（延迟，避免拖慢启动）
         QTimer.singleShot(4000, self._check_for_update)
+        # 启动即把焦点放到输入框，可直接打字
+        self.text_input.setFocus()
+        # 延迟检查模型文件，缺失则明确告知（而不是点录音才报错）
+        QTimer.singleShot(500, self._check_models)
+
+    def _check_models(self):
+        missing = []
+        if not os.path.exists(ASR_MODEL):
+            missing.append("SenseVoice 语音识别模型（model.int8.onnx）")
+        if not os.path.exists(VAD_MODEL):
+            missing.append("Silero VAD 端点检测（silero_vad.onnx）")
+        if not os.path.exists(DENOISER_MODEL):
+            missing.append("GTCRN 降噪模型（gtcrn_simple.onnx）")
+        if missing:
+            QMessageBox.warning(
+                self, "模型文件缺失",
+                "以下模型文件不存在，语音相关功能将不可用：\n\n  · "
+                + "\n  · ".join(missing)
+                + f"\n\n请将对应文件放入目录：\n{MODEL_DIR}",
+            )
 
     # ----------------------------------------------------------
     # 创建所有控件（不组装布局）
@@ -3396,6 +4120,11 @@ class MainWindow(QMainWindow):
         self.conn_label = QLabel("")
         self.conn_label.setObjectName("connOk")
         conn_layout.addWidget(self.conn_label)
+        # OSC 开启引导（游戏内无反应时，绝大多数是 VRChat 里没开 OSC）
+        self.osc_hint = QLabel("游戏内收不到消息？请在 VRChat 打开：设置 → OSC → 启用 OSC，并确认端口为 9000")
+        self.osc_hint.setObjectName("oscHint")
+        self.osc_hint.setWordWrap(True)
+        conn_layout.addWidget(self.osc_hint)
 
         # ---- 消息输入 ----
         self.msg_group = QGroupBox("消息内容")
@@ -3403,7 +4132,8 @@ class MainWindow(QMainWindow):
         msg_layout.setSpacing(6)
         self.text_input = QTextEdit()
         self.text_input.setPlaceholderText("输入消息，或使用下方语音输入...")
-        self.text_input.setMinimumHeight(60)
+        self.text_input.setMinimumHeight(48)
+        self.text_input.setMaximumHeight(150)
         self.text_input.textChanged.connect(self._on_text_changed)
         msg_layout.addWidget(self.text_input)
         self.partial_label = QLabel("")
@@ -3675,6 +4405,10 @@ class MainWindow(QMainWindow):
         """竖屏：Bento Grid 单列。"""
         self.resize(840, 880)
 
+        # 竖屏恢复副标题与语音提示显示
+        self.subtitle_label.setVisible(True)
+        self.voice_hint.setVisible(True)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -3706,10 +4440,14 @@ class MainWindow(QMainWindow):
 
     def _build_landscape(self):
         """横屏：Bento Grid 双列。"""
-        self.resize(1160, 820)
+        self.resize(1160, 900)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(0)
+
+        # 横屏隐藏副标题与语音长提示，把垂直空间让给高频按钮（竖屏再显示）
+        self.subtitle_label.setVisible(False)
+        self.voice_hint.setVisible(False)
 
         # 左侧面板
         left_scroll = QScrollArea()
@@ -3723,9 +4461,8 @@ class MainWindow(QMainWindow):
         left_layout.setSpacing(16)
 
         left_layout.addWidget(self.title_widget)
-        left_layout.addWidget(self.subtitle_label)
         left_layout.addWidget(self.conn_group)
-        left_layout.addWidget(self.msg_group, stretch=1)
+        left_layout.addWidget(self.msg_group)
         left_layout.addWidget(self.btn_widget)
         left_layout.addWidget(self.voice_group)
         left_layout.addStretch()
@@ -3753,10 +4490,14 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(outer)
         self._main_container = splitter
 
-    def _apply_theme(self, theme_id):
-        """切换配色主题：重建样式表、刷新弹层视图样式、重绘极光。"""
+    def _apply_theme(self, theme_id=None, appearance=None):
+        """切换配色/外观：重建样式表、刷新弹层视图样式、重绘壁纸。"""
         global STYLE_SHEET, POPUP_VIEW_QSS_THEMED
-        STYLE_SHEET, POPUP_VIEW_QSS_THEMED = apply_theme(theme_id)
+        if theme_id is None:
+            theme_id = self._theme
+        if appearance is None:
+            appearance = self._appearance
+        STYLE_SHEET, POPUP_VIEW_QSS_THEMED = apply_theme(theme_id, appearance)
         self._theme = CURRENT_THEME
         # 刷新弹层视图的专属样式
         for combo in self.findChildren(QComboBox) + self.float_win.findChildren(QComboBox):
@@ -3764,9 +4505,13 @@ class MainWindow(QMainWindow):
                 combo.view().setStyleSheet(POPUP_VIEW_QSS_THEMED)
             except Exception:
                 pass
-        # 重建全局样式（含字体大小）并重绘极光
+        # 重建全局样式（含字体大小）并重绘壁纸
         self._apply_font_size()
+        # 真玻璃背景：首次尝试启用 Acrylic，之后随外观刷新色调；失败保持自绘壁纸
+        enable_acrylic(self, CURRENT_APPEARANCE)
         self.update()
+        # 同步悬浮窗配色（它永远深色，仅刷新控件避免主题串色）
+        self.float_win.update()
 
     def _apply_font_size(self):
         """根据设置调整全局字体大小。"""
@@ -3835,14 +4580,13 @@ class MainWindow(QMainWindow):
         self.history_list.doItemsLayout()
 
     def paintEvent(self, event):
-        """淡绿色极光背景：先让 QSS 画底色，再叠极光（顺序反了会被底色盖住）。"""
+        """壁纸背景：先让 QSS 画底色，再叠多色弥散光球。"""
         super().paintEvent(event)
         paint_aurora_background(self, event)
-        # 无边框窗口补一圈淡描边，浅色桌面上界定边界
+        # 无边框窗口补一圈中性淡描边，在彩色壁纸上界定窗口边界
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        ar, ag, ab = CURRENT_ACCENT_RGB
-        p.setPen(QColor(ar, ag, ab, 45))
+        p.setPen(QColor(0, 0, 0, 32))
         p.setBrush(Qt.NoBrush)
         p.drawRect(0, 0, self.width() - 1, self.height() - 1)
 
@@ -3929,7 +4673,7 @@ class MainWindow(QMainWindow):
                 effect = QGraphicsDropShadowEffect(self)
                 effect.setBlurRadius(16)
                 effect.setOffset(0, 5)
-                effect.setColor(QColor(20, 80, 40, 42))
+                effect.setColor(QColor(0, 0, 0, 38))
                 group.setGraphicsEffect(effect)
                 group.installEventFilter(self)
         for group in self.float_win.findChildren(QGroupBox):
@@ -4115,10 +4859,12 @@ class MainWindow(QMainWindow):
                 self.denoiser_home_chk.blockSignals(True)
                 self.denoiser_home_chk.setChecked(self._enable_denoiser)
                 self.denoiser_home_chk.blockSignals(False)
-            # 配色主题
-            new_theme = new_cfg.get("theme", "green")
-            if new_theme != self._theme:
-                self._apply_theme(new_theme)
+            # 配色主题 + 外观模式
+            new_theme = new_cfg.get("theme", "apple")
+            new_appearance = new_cfg.get("appearance", "system")
+            if new_theme != self._theme or new_appearance != self._appearance:
+                self._apply_theme(new_theme, new_appearance)
+            self._appearance = new_appearance
 
             # 同步到主界面控件
             self.translate_chk.setChecked(self._translate_enabled)
@@ -4150,7 +4896,8 @@ class MainWindow(QMainWindow):
             "win_geo": [geo.x(), geo.y(), geo.width(), geo.height()],
             "win_maxed": bool(getattr(self, "_maxed", False)),
             "layout_mode": self._layout_mode,
-            "theme": getattr(self, "_theme", "green"),
+            "theme": getattr(self, "_theme", "apple"),
+            "appearance": getattr(self, "_appearance", "system"),
             "font_size": self._font_size,
             "vad_threshold": self._vad_threshold,
             "min_silence_duration": self._min_silence_duration,
@@ -4198,6 +4945,7 @@ class MainWindow(QMainWindow):
             self.conn_label.setText(f"连接失败：{e}")
             self.conn_label.setObjectName("connErr")
             self._repolish(self.conn_label)
+            self.status_bar.showMessage("OSC 连接失败：请确认 VRChat 已运行，并在设置中启用 OSC")
 
     def _repolish(self, widget):
         widget.style().unpolish(widget)
@@ -4329,7 +5077,7 @@ class MainWindow(QMainWindow):
     def _update_char_count(self):
         length = len(self.text_input.toPlainText())
         limit = self._max_chars
-        target = QColor("#ff3b30" if length > limit else ("#ff9500" if length > limit * 0.8 else "#6b8f6b"))
+        target = QColor("#ff3b30" if length > limit else ("#ff9500" if length > limit * 0.8 else "#6e6e73"))
         self.char_label.setText(f"{length} / {limit} 字符")
         self._animate_char_color(target)
 
@@ -4337,7 +5085,7 @@ class MainWindow(QMainWindow):
         """字数警示颜色 180ms 渐变过渡（绿→橙→红不再瞬切）。"""
         cur = getattr(self, "_char_color", None)
         if cur is None:
-            cur = QColor("#6b8f6b")
+            cur = QColor("#6e6e73")
         if cur == target:
             self.char_label.setStyleSheet(f"color: {target.name()};")
             return
@@ -4891,6 +5639,10 @@ class MainWindow(QMainWindow):
         if "] " in text:
             text = text.split("] ", 1)[1]
         self.text_input.setPlainText(text)
+        self.text_input.setFocus()
+        cursor = self.text_input.textCursor()
+        cursor.movePosition(cursor.End)
+        self.text_input.setTextCursor(cursor)
 
     def _clear_history(self):
         if self._history:
@@ -4964,7 +5716,8 @@ class MainWindow(QMainWindow):
                     self.hotkey_chk.setChecked(True)
                 # 加载布局和参数设置
                 self._layout_mode = cfg.get("layout_mode", "portrait")
-                self._theme = cfg.get("theme", "green")
+                self._theme = cfg.get("theme", "apple")
+                self._appearance = cfg.get("appearance", "system")
                 self._font_size = cfg.get("font_size", 10)
                 # 音量阈值（RMS）：旧版灵敏度值 0.1~0.9 迁移为 0.02
                 _vt = cfg.get("vad_threshold", 0.02)
@@ -5024,7 +5777,8 @@ class MainWindow(QMainWindow):
                 "hotkey_scan_code": self._hotkey_scan_code,
                 "hotkey_mode": self._hotkey_mode,
                 "layout_mode": self._layout_mode,
-            "theme": getattr(self, "_theme", "green"),
+            "theme": getattr(self, "_theme", "apple"),
+            "appearance": getattr(self, "_appearance", "system"),
                 "font_size": self._font_size,
                 "vad_threshold": self._vad_threshold,
                 "min_silence_duration": self._min_silence_duration,
