@@ -32,6 +32,23 @@ import urllib.request
 import urllib.parse
 import socket
 
+# ---- 早期崩溃日志：仅 windowed（pythonw/无控制台、stdout 为 None）时兜底 ----
+_BOOT_LOG = None
+if sys.stdout is None or sys.stderr is None:
+    try:
+        _BOOT_LOG = open(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug.log"),
+            "a", encoding="utf-8")
+        _BOOT_LOG.write("\n=== boot %s argv=%s ===\n"
+                        % (time.strftime("%Y-%m-%d %H:%M:%S"), sys.argv))
+        _BOOT_LOG.flush()
+        if sys.stdout is None:
+            sys.stdout = _BOOT_LOG
+        if sys.stderr is None:
+            sys.stderr = _BOOT_LOG
+    except Exception:
+        _BOOT_LOG = None
+
 import numpy as np
 import pyaudio
 import sherpa_onnx
@@ -3628,7 +3645,7 @@ class VoiceEngine(QObject):
         self._device_index = None
         # VAD 参数（可外部调整）
         self._vad_threshold = 0.02  # 音量阈值（RMS），低于它不算语音
-        self._min_silence_duration = 0.5
+        self._min_silence_duration = 0.35
         self._min_speech_duration = 0.25
         self._max_speech_duration = 30
         self._level = 0.0  # 实时输入电平 (0..1)，UI 音量条轮询用
@@ -3649,7 +3666,7 @@ class VoiceEngine(QObject):
         self._language = language or "zh"
 
     def set_vad_params(self, threshold=None, min_silence=None, min_speech=None, max_speech=None):
-        """更新 VAD 参数（下次初始化模型时生效）。"""
+        """更新 VAD 参数，并即时同步到已创建的分段器（运行中调整也立即生效）。"""
         if threshold is not None:
             self._vad_threshold = threshold
         if min_silence is not None:
@@ -3658,6 +3675,14 @@ class VoiceEngine(QObject):
             self._min_speech_duration = min_speech
         if max_speech is not None:
             self._max_speech_duration = max_speech
+        # 同步到当前分段器：否则只改字段，已创建的 _segmenter 仍用旧值
+        seg = getattr(self, "_segmenter", None)
+        if seg is not None:
+            # 与 _init_models 创建分段器时的映射口径保持一致
+            seg.min_rms = self._vad_threshold
+            seg.min_speech = max(0.15, self._min_speech_duration * 0.8)
+            seg.min_silence = max(0.25, self._min_silence_duration * 0.9)
+            seg.max_speech = self._max_speech_duration
 
     def _init_models(self):
         # 语言变更时重建识别器，让语言切换立即生效
@@ -3681,7 +3706,7 @@ class VoiceEngine(QObject):
             sr=SAMPLE_RATE,
             gain=2.0,
             min_speech=max(0.15, self._min_speech_duration * 0.8),
-            min_silence=max(0.4, self._min_silence_duration * 0.9),
+            min_silence=max(0.25, self._min_silence_duration * 0.9),
             max_speech=self._max_speech_duration,
             min_rms=self._vad_threshold,
         )
@@ -3955,7 +3980,7 @@ class MainWindow(QMainWindow):
         self._font_size = 10
         self._vad_threshold = 0.02  # 音量阈值（RMS）
         self._enable_denoiser = False  # 识别前降噪（GTCRN）
-        self._min_silence_duration = 0.5
+        self._min_silence_duration = 0.35
         self._min_speech_duration = 0.25
         self._max_chars = 144
         # 翻译参数
@@ -4834,7 +4859,7 @@ class MainWindow(QMainWindow):
             self._layout_mode = new_cfg.get("layout_mode", "portrait")
             self._font_size = new_cfg.get("font_size", 10)
             self._vad_threshold = new_cfg.get("vad_threshold", 0.02)
-            self._min_silence_duration = new_cfg.get("min_silence_duration", 0.5)
+            self._min_silence_duration = new_cfg.get("min_silence_duration", 0.35)
             self._min_speech_duration = new_cfg.get("min_speech_duration", 0.25)
             self._max_chars = new_cfg.get("max_chars", 144)
             self._translate_enabled = new_cfg.get("translate_enabled", False)
@@ -5722,7 +5747,7 @@ class MainWindow(QMainWindow):
                 # 音量阈值（RMS）：旧版灵敏度值 0.1~0.9 迁移为 0.02
                 _vt = cfg.get("vad_threshold", 0.02)
                 self._vad_threshold = _vt if (isinstance(_vt, (int, float)) and 0 < _vt <= 0.15) else 0.02
-                self._min_silence_duration = cfg.get("min_silence_duration", 0.5)
+                self._min_silence_duration = cfg.get("min_silence_duration", 0.35)
                 self._min_speech_duration = cfg.get("min_speech_duration", 0.25)
                 self._max_chars = cfg.get("max_chars", 144)
                 # 翻译设置
@@ -5822,7 +5847,45 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+def _install_crash_log():
+    """无控制台（pythonw / windowed 打包）时把输出与未捕获异常写入持久 debug.log，
+    既防 print 到 None 直接退出，也便于定位；有可用控制台时不产生日志。"""
+    have_console = (not getattr(sys, "frozen", False)
+                    and sys.stdout is not None and sys.stderr is not None)
+    if have_console:
+        return None
+    try:
+        logf = open(os.path.join(APP_DIR, "debug.log"), "a",
+                    encoding="utf-8", errors="ignore")
+        logf.write("\n===== start %s =====\n"
+                   % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        logf.flush()
+        sys.stdout = logf
+        sys.stderr = logf
+
+        def _hook(etype, value, tb):
+            import traceback as _tb
+            logf.write("UNCAUGHT:\n"
+                       + "".join(_tb.format_exception(etype, value, tb)))
+            logf.flush()
+
+        sys.excepthook = _hook
+        try:
+            def _thook(args):
+                import traceback as _tb
+                logf.write("THREAD UNCAUGHT:\n" + "".join(_tb.format_exception(
+                    args.exc_type, args.exc_value, args.exc_traceback)))
+                logf.flush()
+            threading.excepthook = _thook
+        except Exception:
+            pass
+        return logf
+    except Exception:
+        return None
+
+
 def main():
+    _install_crash_log()
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLE_SHEET)
     window = MainWindow()
