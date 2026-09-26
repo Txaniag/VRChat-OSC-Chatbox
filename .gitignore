@@ -19,3 +19,5 @@ build_tmp/
 dist_speaker_onedir/
 *.bak
 *.bak_before_apple
+
+config/

@@ -104,7 +104,7 @@ DENOISER_MODEL = os.path.join(MODEL_DIR, "gtcrn_simple.onnx")
 # 常量
 # ============================================================
 APP_TITLE = "VRChat OSC Chatbox Sender"
-APP_VERSION = "4.4.0"
+APP_VERSION = "4.4.1"
 DEFAULT_IP = "127.0.0.1"
 DEFAULT_PORT = 9000
 MAX_CHARS = 144
@@ -3028,9 +3028,10 @@ def _maybe_denoise(engine, samples):
 class _EnergySegmenter:
     """语音分段器（WebRTC VAD 帧判定，能量门限兜底）。
 
-    sherpa-onnx 1.13.x 的 Silero VAD 在部分环境出段损坏（只产出 0 采样空段）。
-    首选 WebRTC VAD（频谱特征判定，比纯能量抗噪得多）；webrtcvad 不可用时
-    退回自适应噪声底能量门限。
+    首选 WebRTC VAD（频谱特征判定，比纯能量抗噪得多），其判定直接生效；
+    早期版本在 WebRTC 之上叠加能量二次否决/噪声门限，会把正常说话误判成静音，
+    故 WebRTC 路径不再叠加。webrtcvad 不可用时退回自适应噪声底能量门限，
+    手动 min_rms 阈值仅在该兜底路径生效。
     """
 
     def __init__(self, sr=16000, gain=1.4, min_speech=0.25,
@@ -3040,7 +3041,7 @@ class _EnergySegmenter:
         self.min_speech = min_speech
         self.min_silence = min_silence
         self.max_speech = max_speech
-        self.min_rms = min_rms  # 绝对音量阈值：RMS 低于它不算语音
+        self.min_rms = min_rms  # 仅能量兜底路径使用的绝对音量阈值
         self.in_speech = False  # 供 UI 说话状态显示
         self.segments = []
         self._speech_run = 0.0
@@ -3048,19 +3049,16 @@ class _EnergySegmenter:
         self._in_speech = False
         self._seg_buf = []
         self._preroll_buf = []
-        self.suppressed = False  # 持续音频（音乐）硬切后的反刷屏抑制
-        self._quiet_run = 0.0
 
         # ---- WebRTC VAD（首选）----
         self._webrtc = None
         try:
             import webrtcvad
-            self._webrtc = webrtcvad.Vad(3)  # 0-3，3=最激进（少误报）
+            self._webrtc = webrtcvad.Vad(2)  # 0-3，2=均衡
             self._frame_samples = int(sr * 0.03)  # 30ms 帧
             self._frame_bytes_len = self._frame_samples * 2  # int16
             self._frame_acc = b""
             self._preroll_n = max(1, int(preroll / 0.03))
-            self._w_noise = None  # 能量门限噪声底，首帧校准
             return
         except Exception:
             pass
@@ -3070,6 +3068,7 @@ class _EnergySegmenter:
         self._hist = deque(maxlen=250)
         self._smooth = None
         self._buf = []
+        self._noise = 0.003
 
     def accept(self, x):
         if self._webrtc is not None:
@@ -3085,34 +3084,12 @@ class _EnergySegmenter:
 
     def _process_webrtc_frame(self, frame_bytes):
         dur = self._frame_samples / self.sr
-        arr = np.frombuffer(frame_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        # 能量门限：WebRTC 判为语音但音量接近底噪的帧按静音处理，
-        # 从根源上防"没说话也识别出字"（背景噪声被误判成语音）
-        rms = float(np.sqrt(np.mean(arr * arr))) if len(arr) else 0.0
-        if self._w_noise is None:
-            self._w_noise = rms  # 首帧校准到实际环境底噪
-        elif rms < self._w_noise:
-            self._w_noise = rms * 0.9 + self._w_noise * 0.1
-        else:
-            self._w_noise = self._w_noise * 0.999  # 慢速上漂，不被短促声音拉高
         try:
             is_speech = self._webrtc.is_speech(frame_bytes, self.sr)
         except Exception:
             is_speech = False
-        # 音量接近底噪（<1.5x）不算语音
-        if is_speech and rms < max(self._w_noise * 1.5, self.min_rms, 0.003):
-            is_speech = False
+        arr = np.frombuffer(frame_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         if not self._in_speech:
-            # 抑制期（持续音频硬切后）：等出现 0.4s 安静帧才恢复切分，防止节奏性刷歌词
-            if self.suppressed:
-                if is_speech:
-                    self._quiet_run = 0.0
-                else:
-                    self._quiet_run += dur
-                    if self._quiet_run >= 0.4:
-                        self.suppressed = False
-                        self._quiet_run = 0.0
-                return
             self._preroll_buf.append(arr)
             if len(self._preroll_buf) > self._preroll_n:
                 del self._preroll_buf[:-self._preroll_n]
@@ -3135,7 +3112,6 @@ class _EnergySegmenter:
             total = sum(len(a) for a in self._seg_buf) / self.sr
             if self._sil_run >= self.min_silence or total >= self.max_speech:
                 seg = np.concatenate(self._seg_buf)
-                hard_cut = self._sil_run < self.min_silence  # 没有安静间隙，到时长上限被硬切
                 if self._sil_run >= self.min_silence and self._sil_run * self.sr < len(seg):
                     seg = seg[:len(seg) - int(self._sil_run * self.sr)]
                 if len(seg) >= self.min_speech * self.sr:
@@ -3145,10 +3121,6 @@ class _EnergySegmenter:
                 self.in_speech = False
                 self._speech_run = 0.0
                 self._sil_run = 0.0
-                if hard_cut:
-                    # 持续音频（音乐/长独白）：进入抑制期，等 0.4s 安静帧再恢复
-                    self.suppressed = True
-                    self._quiet_run = 0.0
 
     def _accept_energy(self, x):
         """能量门限兜底路径（webrtcvad 不可用时）。"""
@@ -3157,17 +3129,6 @@ class _EnergySegmenter:
         lvl = self._smooth
         if not self._in_speech:
             self._hist.append(lvl)
-            # 抑制期：等安静了才恢复（与 webrtc 路径同一策略）
-            if self.suppressed:
-                thr = max(self._noise * self.gain, self.min_rms)
-                if lvl > thr:
-                    self._quiet_run = 0.0
-                else:
-                    self._quiet_run += len(x) / self.sr
-                    if self._quiet_run >= 0.4:
-                        self.suppressed = False
-                        self._quiet_run = 0.0
-                return
         self._noise = max(min(self._hist), 0.003)
         thr = max(self._noise * self.gain, self.min_rms)
         dur = len(x) / self.sr
@@ -3192,7 +3153,6 @@ class _EnergySegmenter:
             total = sum(len(a) for a in self._buf) / self.sr
             if self._sil_run >= self.min_silence or total >= self.max_speech:
                 seg = np.concatenate(self._buf)
-                hard_cut = self._sil_run < self.min_silence
                 if self._sil_run >= self.min_silence and self._sil_run * self.sr < len(seg):
                     seg = seg[:len(seg) - int(self._sil_run * self.sr)]
                 if len(seg) >= self.min_speech * self.sr:
@@ -3202,9 +3162,6 @@ class _EnergySegmenter:
                 self.in_speech = False
                 self._speech_run = 0.0
                 self._sil_run = 0.0
-                if hard_cut:
-                    self.suppressed = True
-                    self._quiet_run = 0.0
 
     def pop_segments(self):
         out, self.segments = self.segments, []
@@ -3225,6 +3182,7 @@ class _EnergySegmenter:
         self.in_speech = False
         self._speech_run = 0.0
         self._sil_run = 0.0
+
 
 
 def _obfuscate_secret(text):
@@ -5342,8 +5300,6 @@ class MainWindow(QMainWindow):
             seg = self.speaker_engine._segmenter
             seg._seg_buf = []
             seg._preroll_buf.clear()
-            seg.suppressed = False
-            seg._quiet_run = 0.0
 
     def _set_speaker_btn_active(self, active):
         self.speaker_btn.setText("⏹  停止翻译" if active else "🖥  悬浮翻译 BETA")
