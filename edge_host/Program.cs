@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Windows.Forms;
@@ -11,6 +12,12 @@ using Microsoft.Web.WebView2.WinForms;
 // 由 VRChat OSC Chatbox 的 Python 侧用 subprocess 启动，CREATE_NO_WINDOW 下无窗口。
 class SpeechHost : Form
 {
+    // 必须绕开 Console.Out/Console.In：中文 Windows 上它们默认用系统代码页(GBK)，
+    // 识别结果是中文时 Python 按 UTF-8 读会解码失败，读取线程直接挂掉
+    // （表现：界面一直"识别中"，说话没有任何反应）。这里显式走原始句柄 + UTF-8。
+    static readonly StreamWriter Out = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+    static readonly StreamReader In = new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false));
+
     WebView2 wv;
     volatile bool exiting = false;
     string currentLang = "zh-CN";
@@ -99,7 +106,14 @@ function setAutoRestart(v){ autoRestart = !!v; }
             if (!string.IsNullOrEmpty(proxy))
                 args += " --proxy-server=\"" + proxy + "\"";
             var opts = new CoreWebView2EnvironmentOptions(args);
-            var env = await CoreWebView2Environment.CreateAsync(null, null, opts);
+            // 用户数据目录固定到 LocalAppData：WebView2 默认放在 exe 旁边，打包后就落在
+            // PyInstaller 的临时解压目录里 —— 30MB 浏览器缓存/崩溃转储被打进 exe，
+            // 运行时还往 temp 写、拖慢退出清理。放固定位置还能吃到缓存，下次启动更快。
+            var userData = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "VRChatOSCChatbox", "EdgeWebView2");
+            Directory.CreateDirectory(userData);
+            var env = await CoreWebView2Environment.CreateAsync(null, userData, opts);
             await wv.EnsureCoreWebView2Async(env);
         }
         catch (Exception ex)
@@ -205,13 +219,13 @@ function setAutoRestart(v){ autoRestart = !!v; }
                 raw = doc.RootElement.GetString() ?? raw;
         }
         catch { /* 解不开就原样输出 */ }
-        Console.WriteLine(raw);
-        Console.Out.Flush();
+        Out.WriteLine(raw);
+        Out.Flush();
     }
 
     void ReadStdinLoop()
     {
-        var input = Console.In;
+        var input = In;
         string line;
         while (!exiting && (line = input.ReadLine()) != null)
         {
@@ -296,8 +310,8 @@ function setAutoRestart(v){ autoRestart = !!v; }
 
     static void Emit(object obj)
     {
-        Console.WriteLine(JsonSerializer.Serialize(obj));
-        Console.Out.Flush();
+        Out.WriteLine(JsonSerializer.Serialize(obj));
+        Out.Flush();
     }
 
     static string Esc(string s) => (s ?? "").Replace("\\", "\\\\").Replace("'", "\\'");

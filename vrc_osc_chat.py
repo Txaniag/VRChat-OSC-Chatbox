@@ -2078,6 +2078,28 @@ def _edge_host_exe():
             return c
     return None
 
+def _decode_host_line(raw):
+    """宿主 stdout 一行的解码。
+
+    中文 Windows 上 .NET 的 Console.Out 走系统代码页(GBK)，宿主发出的识别结果
+    是 GBK 字节。用 text=True + utf-8 读会在第一句中文上抛 UnicodeDecodeError，
+    把读取线程整个弄死（表现：一直"识别中"，说话没反应）。这里逐行自解码：
+    先严格试 UTF-8（新版宿主），失败再试 GBK（旧版宿主），最后兜底替换字符，
+    永不抛异常。
+    """
+    if isinstance(raw, str):
+        return raw.strip()
+    for enc in ("utf-8", "gbk"):
+        try:
+            return raw.decode(enc).strip()
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace").strip()
+
+# 静音时 Web Speech 自己会 end → no-speech → 150ms 后重启，属正常节奏，
+# 当错误报出去会让状态栏一直刷屏。真故障（network/not-allowed/audio-capture）照常上报。
+_EDGE_BENIGN_ERRORS = {"no-speech", "aborted"}
+
 class EdgeRecognizer:
     """Edge 在线识别（WebView2 + Web Speech API），stdin/stdout JSON 通信。"""
     def __init__(self):
@@ -2089,6 +2111,9 @@ class EdgeRecognizer:
         self.on_listening = None
         self._ready = False
         self._start_pending = None  # (lang,)
+        self._expected_exit = False  # 我们主动 stop 过 → 宿主退出不算故障
+        self._stderr_tail = []       # 宿主 stderr 最后几行（缺 .NET 等报错在这）
+        self._exit_reported = False
 
     def running(self):
         return self._proc is not None and self._proc.poll() is None
@@ -2103,16 +2128,27 @@ class EdgeRecognizer:
                 if self.on_error: self.on_error("未找到 EdgeSpeechHost.exe")
                 return
             CREATE_NO_WINDOW = 0x08000000
-            self._proc = subprocess.Popen(
-                [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                creationflags=CREATE_NO_WINDOW)
+            self._expected_exit = False
+            self._exit_reported = False
+            self._stderr_tail = []
+            self._start_pending = (lang,)   # 先置好，再开读线程，避免 started 抢跑
+            try:
+                # 二进制管道：编码自己在 _decode_host_line 里处理，读不挂
+                self._proc = subprocess.Popen(
+                    [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, creationflags=CREATE_NO_WINDOW)
+            except Exception as e:
+                self._proc = None
+                if self.on_error:
+                    self.on_error("Edge 宿主启动失败: %s" % e)
+                return
+            threading.Thread(target=self._drain_stderr, daemon=True).start()
             self._reader = threading.Thread(target=self._read_loop, daemon=True)
             self._reader.start()
-            self._start_pending = (lang,)
 
     def stop(self):
         with self._lock:
+            self._expected_exit = True
             if self.running():
                 self._send({"cmd": "exit"})
             self._proc = None
@@ -2124,16 +2160,49 @@ class EdgeRecognizer:
     def _send(self, obj):
         try:
             if self.running():
-                self._proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                payload = json.dumps(obj, ensure_ascii=False) + "\n"
+                self._proc.stdin.write(payload.encode("utf-8"))
                 self._proc.stdin.flush()
         except Exception:
             pass
 
-    def _read_loop(self):
+    def _drain_stderr(self):
+        """把 stderr 抽干（不读会撑满 64KB 管道把宿主卡死），留尾几行做诊断。"""
+        proc = self._proc
         try:
-            for line in self._proc.stdout:
-                line = line.strip()
-                if not line: continue
+            for raw in iter(proc.stderr.readline, b""):
+                line = _decode_host_line(raw)
+                if line:
+                    self._stderr_tail.append(line)
+                    del self._stderr_tail[:-8]
+        except Exception:
+            pass
+
+    def _report_exit(self, proc):
+        if self._exit_reported or self._expected_exit:
+            return
+        if self._proc is not proc:      # 已被 stop()/重启接管，属陈旧会话，别误报
+            return
+        self._exit_reported = True
+        if not self.on_error:
+            return
+        rc = proc.poll()
+        msg = "Edge 宿主已退出(代码 %s)" % rc
+        tail = " | ".join(self._stderr_tail[-3:])
+        if tail:
+            msg += "：" + tail
+        elif not self._ready:
+            msg += "：未初始化成功，请确认已安装 Edge WebView2 运行时"
+        self.on_error(msg)
+
+    def _read_loop(self):
+        """逐行读宿主输出。解码/解析失败只跳过这一行，绝不能让线程退出。"""
+        proc = self._proc
+        try:
+            for raw in iter(proc.stdout.readline, b""):
+                line = _decode_host_line(raw)
+                if not line:
+                    continue
                 try:
                     m = json.loads(line)
                 except Exception:
@@ -2146,7 +2215,10 @@ class EdgeRecognizer:
                     self._ready = True
                     if self.on_listening: self.on_listening()
                 elif t == "error":
-                    if self.on_error: self.on_error(m.get("code") or m.get("msg") or "edge-error")
+                    code = m.get("code") or m.get("msg") or "edge-error"
+                    if code in _EDGE_BENIGN_ERRORS:
+                        continue
+                    if self.on_error: self.on_error(code)
                 elif t == "started":
                     self._ready = True
                     with self._lock:
@@ -2156,6 +2228,8 @@ class EdgeRecognizer:
                             self._send({"cmd": "start", "lang": lang[0]})
         except Exception:
             pass
+        # stdout 关闭 = 宿主没了：报出来，别让用户对着"识别中"干等
+        self._report_exit(proc)
 
 # ============================================================
 # 扬声器悬浮翻译引擎 - 捕获扬声器回环音频 → 能量切段 → 识别 → 翻译
@@ -3865,7 +3939,9 @@ class VoiceEngine(QObject):
         self._stop_flag = True
         self._edge_stop.set()
 
-    def _open_stream(self):
+    def _open_stream(self, meter_only=False):
+        """meter_only=True：只算电平给 UI 音量条，不塞识别队列（Edge 在线模式用，
+        那时麦克风由 WebView2 自己抓，这里纯粹为了不让电平条卡在 0）。"""
         self._pa = pyaudio.PyAudio()
         dev_idx = self._device_index
         if dev_idx is not None:
@@ -3878,7 +3954,8 @@ class VoiceEngine(QObject):
         self._level = 0.0  # 归一化输入电平，供 UI 音量条轮询
 
         def callback(in_data, frame_count, time_info, status):
-            self._audio_queue.put(in_data)
+            if not meter_only:
+                self._audio_queue.put(in_data)
             try:
                 samples = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
                 rms = float(np.sqrt(np.mean(samples * samples)))
@@ -3936,13 +4013,25 @@ class VoiceEngine(QObject):
                 self._edge.on_error = lambda e: self.error.emit("Edge识别: " + str(e))
             lang = EDGE_LANG_MAP.get(self._language, "zh-CN")
             self._edge_stop.clear()
+            try:
+                # 只喂电平条：Edge 模式下麦克风是 WebView2 自己抓的，
+                # Python 这边不开流的话音量条会一直卡在 0（看着像完全没反应）
+                self._open_stream(meter_only=True)
+            except Exception:
+                self._level = 0.0
             self._edge.start(lang)
             self.status.emit("Edge 在线识别中...")
+            t0 = time.time()
             while self._running and not self._edge_stop.is_set():
+                # 宿主自己没了（WebView2 初始化失败 / 缺 .NET 运行时等）：
+                # 走人，让错误冒出来，别让用户对着"识别中"干等
+                if time.time() - t0 > 3.0 and not self._edge.running():
+                    break
                 time.sleep(0.2)
         finally:
             if self._edge is not None:
                 self._edge.stop()
+            self._close_stream()
             self._running = False
             self._in_speech = False
             self.pttFinished.emit()
