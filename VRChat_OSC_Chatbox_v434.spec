@@ -51,7 +51,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='VRChat_OSC_Chatbox_v4.4.1',
+    name='VRChat_OSC_Chatbox_v4.4.2',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -60,7 +60,8 @@ from PyQt5.QtWidgets import (
     QMessageBox, QComboBox, QRadioButton, QButtonGroup, QScrollArea, QFrame,
     QDialog, QSlider, QSpinBox, QFormLayout, QDialogButtonBox, QSplitter,
     QGraphicsBlurEffect, QGraphicsOpacityEffect, QGraphicsDropShadowEffect,
-    QStyledItemDelegate, QScrollBar, QSystemTrayIcon, QMenu, QStyle
+    QStyledItemDelegate, QScrollBar, QSystemTrayIcon, QMenu, QStyle,
+    QColorDialog
 )
 from PyQt5.QtCore import (
     Qt, QTimer, pyqtSignal, QObject, QPointF, QPoint, QRect, QRectF, QSize,
@@ -104,7 +105,7 @@ DENOISER_MODEL = os.path.join(MODEL_DIR, "gtcrn_simple.onnx")
 # 常量
 # ============================================================
 APP_TITLE = "VRChat OSC Chatbox Sender"
-APP_VERSION = "4.4.1"
+APP_VERSION = "4.4.2"
 DEFAULT_IP = "127.0.0.1"
 DEFAULT_PORT = 9000
 MAX_CHARS = 144
@@ -146,7 +147,7 @@ QSplitter::handle { background: transparent; }
 
 /* ---- Bento Cards (白色玻璃材质, HIG light material) ---- */
 QGroupBox {
-    background-color: rgba(255, 255, 255, 0.72);
+    background-color: rgba(255, 255, 255, 0.8);
     border: 1px solid rgba(0, 0, 0, 0.1);
     border-radius: 20px;
     margin-top: 6px;
@@ -641,7 +642,7 @@ QSplitter::handle { background: transparent; }
 
 /* ---- Bento Cards (深色玻璃材质) ---- */
 QGroupBox {
-    background-color: rgba(28, 28, 30, 0.72);
+    background-color: rgba(28, 28, 30, 0.78);
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 20px;
     margin-top: 6px;
@@ -1201,13 +1202,16 @@ _ACCENT_HEX_DARK = ["#0a84ff", "#409cff", "#0060df"]
 _ACCENT_RGB_DARK = ["10, 132, 255"]
 
 # 壁纸（底色 + 4 个弥散光球）
+# 配色原则：四个光球全部取强调色的邻近色（蓝→靛→青），不掺红/粉——
+# 红粉混进冷调底色会发灰发脏，正是老版壁纸“难看”的来源。
+# 光球随主题色相整体偏移，换配色主题时壁纸与按钮同调。
 _WALLPAPER_LIGHT = [
-    (245, 245, 247), (92, 150, 255), (255, 150, 182), (178, 142, 255),
-    (110, 215, 225),
+    (244, 245, 248), (86, 140, 255), (96, 205, 230), (136, 124, 255),
+    (170, 205, 255),
 ]
 _WALLPAPER_DARK = [
-    (16, 16, 20), (36, 80, 158), (148, 60, 100), (86, 66, 156),
-    (34, 116, 126),
+    (13, 14, 18), (48, 100, 210), (34, 130, 152), (96, 80, 190),
+    (54, 74, 160),
 ]
 
 THEMES = {
@@ -1217,6 +1221,8 @@ THEMES = {
     "orange": {"name": "珊瑚橙", "accent": "#ff9500"},
     "green":  {"name": "薄荷绿", "accent": "#34c759"},
     "teal":   {"name": "青碧",   "accent": "#00c7be"},
+    # 自定义：accent 由用户选色注入（set_custom_accent），默认等同苹果蓝
+    "custom": {"name": "自定义颜色…", "accent": "#007AFF"},
 }
 
 # 外观模式：system / light / dark
@@ -1366,6 +1372,24 @@ def _theme_hue_shift(theme_id):
     return th - ah
 
 
+def set_custom_accent(hexv):
+    """注入用户自选的主题色，返回规范化后的 hex。
+
+    只取所选颜色的**色相**，明度/饱和度沿用苹果蓝的 HIG 结构——
+    这样任意颜色都会被规范成一套对比度达标的按钮/焦点/电平条配色，
+    不会出现“选了个浅色 → 白字看不清”的情况；同时也保证样式表里的
+    色相偏移机制（_hue_replace）能正确还原出所选颜色。
+    非法输入直接忽略，返回当前值。
+    """
+    if isinstance(hexv, str):
+        v = hexv.strip().lstrip("#")
+        if re.fullmatch(r"[0-9a-fA-F]{6}", v or ""):
+            ah, _, _ = _hex2hls(THEMES["apple"]["accent"])
+            ch, _, _ = _hex2hls("#" + v)
+            THEMES["custom"]["accent"] = _shift_hex(THEMES["apple"]["accent"], ch - ah)
+    return THEMES["custom"]["accent"]
+
+
 def _hue_replace(text, values, dh, is_hex):
     """对一组 hex/rgb 统一做色相偏移；两阶段占位替换避免连锁替换。"""
     if abs(dh) <= 1e-9:
@@ -1402,10 +1426,21 @@ def build_stylesheet(theme_id, appearance):
 
 
 def aurora_colors(theme_id, appearance):
-    """返回对应外观的壁纸底色 + 4 个弥散光球颜色（多色固定）。"""
-    if appearance == "dark":
-        return list(_WALLPAPER_DARK)
-    return list(_WALLPAPER_LIGHT)
+    """返回对应外观的壁纸底色 + 4 个弥散光球颜色。
+
+    底色保持中性灰不动；光球跟随主题做强制色相偏移，
+    让壁纸与该主题的强调色同调（苹果蓝=冷蓝、珊瑚橙=暖橙…）。
+    """
+    raw = _WALLPAPER_DARK if appearance == "dark" else _WALLPAPER_LIGHT
+    dh = _theme_hue_shift(theme_id)
+    if abs(dh) <= 1e-9:
+        return list(raw)
+
+    def _shift(c):
+        r, g, b = _shift_rgb("%d,%d,%d" % c, dh).split(",")
+        return (int(r), int(g), int(b))
+
+    return [raw[0]] + [_shift(c) for c in raw[1:]]
 
 
 def apply_theme(theme_id, appearance_mode="system"):
@@ -1751,6 +1786,7 @@ class MicLevelBar(QWidget):
 
     def set_threshold(self, rms):
         self._min_rms = max(0.001, min(0.1, float(rms)))
+        self.setToolTip("最低触发音量: %.3f" % self._min_rms)
         self.update()
 
     def threshold(self):
@@ -2765,33 +2801,33 @@ def paint_aurora_background(widget, event):
         painter.fillRect(event.rect(), QColor(base[0], base[1], base[2]))
     painter.setPen(Qt.NoPen)
 
-    # 光球 1: 左上 (蓝)
+    # 光球 1: 左上（主强调色，最大最亮）
     c1 = QRadialGradient(w * 0.12, h * 0.12, max(w, h) * 0.55)
-    c1.setColorAt(0, QColor(b1[0], b1[1], b1[2], int(105 * k)))
-    c1.setColorAt(0.5, QColor(b1[0], b1[1], b1[2], int(40 * k)))
+    c1.setColorAt(0, QColor(b1[0], b1[1], b1[2], int(96 * k)))
+    c1.setColorAt(0.5, QColor(b1[0], b1[1], b1[2], int(36 * k)))
     c1.setColorAt(1, QColor(b1[0], b1[1], b1[2], 0))
     painter.setBrush(QBrush(c1))
     painter.drawEllipse(QPointF(w * 0.12, h * 0.12), w * 0.55, h * 0.55)
 
-    # 光球 2: 右下 (粉)
+    # 光球 2: 右下（青，冷调提亮）
     c2 = QRadialGradient(w * 0.88, h * 0.85, max(w, h) * 0.55)
-    c2.setColorAt(0, QColor(b2[0], b2[1], b2[2], int(85 * k)))
-    c2.setColorAt(0.5, QColor(b2[0], b2[1], b2[2], int(30 * k)))
+    c2.setColorAt(0, QColor(b2[0], b2[1], b2[2], int(76 * k)))
+    c2.setColorAt(0.5, QColor(b2[0], b2[1], b2[2], int(28 * k)))
     c2.setColorAt(1, QColor(b2[0], b2[1], b2[2], 0))
     painter.setBrush(QBrush(c2))
     painter.drawEllipse(QPointF(w * 0.88, h * 0.85), w * 0.52, h * 0.52)
 
-    # 光球 3: 中上 (紫)
+    # 光球 3: 中上（靛紫，增加层次）
     c3 = QRadialGradient(w * 0.62, h * 0.25, max(w, h) * 0.4)
-    c3.setColorAt(0, QColor(b3[0], b3[1], b3[2], int(70 * k)))
+    c3.setColorAt(0, QColor(b3[0], b3[1], b3[2], int(60 * k)))
     c3.setColorAt(1, QColor(b3[0], b3[1], b3[2], 0))
     painter.setBrush(QBrush(c3))
     painter.drawEllipse(QPointF(w * 0.62, h * 0.25), w * 0.38, h * 0.38)
 
-    # 光球 4: 底部偏左 (青)
+    # 光球 4: 底部偏左（淡蓝，压住底边）
     c4 = QRadialGradient(w * 0.32, h * 0.95, max(w, h) * 0.45)
-    c4.setColorAt(0, QColor(b4[0], b4[1], b4[2], int(75 * k)))
-    c4.setColorAt(0.6, QColor(b4[0], b4[1], b4[2], int(25 * k)))
+    c4.setColorAt(0, QColor(b4[0], b4[1], b4[2], int(66 * k)))
+    c4.setColorAt(0.6, QColor(b4[0], b4[1], b4[2], int(24 * k)))
     c4.setColorAt(1, QColor(b4[0], b4[1], b4[2], 0))
     painter.setBrush(QBrush(c4))
     painter.drawEllipse(QPointF(w * 0.32, h * 0.95), w * 0.42, h * 0.42)
@@ -3025,13 +3061,45 @@ def _maybe_denoise(engine, samples):
         return samples
 
 
+def _loudest_rms(samples, sr, window_s=0.3):
+    """取最响的 window_s 秒的 RMS。
+
+    不能直接用整段 RMS：PTT 按住的一段时间里大部分是静音，
+    平均值会被拉低，正常说话也会被误判成“音量太小”。
+    """
+    if samples is None or len(samples) == 0:
+        return 0.0
+    win = max(1, int(window_s * sr))
+    if len(samples) <= win:
+        return float(np.sqrt(np.mean(samples * samples)))
+    n = len(samples) // win
+    chunks = np.asarray(samples[:n * win], dtype=np.float32).reshape(n, win)
+    return float(np.max(np.sqrt(np.mean(chunks * chunks, axis=1))))
+
+
+def _vad_aggressiveness(min_rms):
+    """按最低触发音量选 WebRTC 判定档位（0-3，越大越严格）。
+
+    阈值调低 = 用户想要更灵敏（小声/耳语也能触发），此时放宽 WebRTC 判定；
+    默认 0.02 及以上维持 2（平衡档），保证老用户默认行为完全不变。
+    只放宽、不收紧：收紧档位(3)会把正常说话切碎，正是此前“说了不识别”的坑。
+    """
+    try:
+        return 1 if float(min_rms) < 0.012 else 2
+    except (TypeError, ValueError):
+        return 2
+
+
 class _EnergySegmenter:
     """语音分段器（WebRTC VAD 帧判定，能量门限兜底）。
 
-    首选 WebRTC VAD（频谱特征判定，比纯能量抗噪得多），其判定直接生效；
-    早期版本在 WebRTC 之上叠加能量二次否决/噪声门限，会把正常说话误判成静音，
-    故 WebRTC 路径不再叠加。webrtcvad 不可用时退回自适应噪声底能量门限，
-    手动 min_rms 阈值仅在该兜底路径生效。
+    首选 WebRTC VAD（频谱特征判定，比纯能量抗噪得多）；
+    “最低触发音量”阈值在两条路径上都生效：
+      * WebRTC 路径：作为**起段门限**（包络快攻慢放后比较），低于阈值不起段，
+        起段后仍完全交给 WebRTC 判定续段——不会在说话中途因瞬时低能量被掐断，
+        避免重现早期“能量二次否决导致正常说话被判静音”的问题；
+      * 能量兜底路径（webrtcvad 不可用）：沿用绝对音量阈值。
+    webrtcvad 不可用时退回自适应噪声底能量门限。
     """
 
     def __init__(self, sr=16000, gain=1.4, min_speech=0.25,
@@ -3041,7 +3109,8 @@ class _EnergySegmenter:
         self.min_speech = min_speech
         self.min_silence = min_silence
         self.max_speech = max_speech
-        self.min_rms = min_rms  # 仅能量兜底路径使用的绝对音量阈值
+        self.min_rms = max(0.001, min(0.15, float(min_rms)))  # 最低触发音量（RMS）
+        self._env = None  # WebRTC 路径的电平包络（快攻慢放），门限比较用
         self.in_speech = False  # 供 UI 说话状态显示
         self.segments = []
         self._speech_run = 0.0
@@ -3054,7 +3123,8 @@ class _EnergySegmenter:
         self._webrtc = None
         try:
             import webrtcvad
-            self._webrtc = webrtcvad.Vad(2)  # 0-3，2=均衡
+            self._vad_level = _vad_aggressiveness(self.min_rms)
+            self._webrtc = webrtcvad.Vad(self._vad_level)
             self._frame_samples = int(sr * 0.03)  # 30ms 帧
             self._frame_bytes_len = self._frame_samples * 2  # int16
             self._frame_acc = b""
@@ -3082,6 +3152,20 @@ class _EnergySegmenter:
             return
         self._accept_energy(x)
 
+    def set_min_rms(self, rms):
+        """更新最低触发音量（运行中调整立即生效）：同步阈值与 WebRTC 判定档位。"""
+        self.min_rms = max(0.001, min(0.15, float(rms)))
+        if self._webrtc is not None:
+            try:
+                level = _vad_aggressiveness(self.min_rms)
+                if level != getattr(self, "_vad_level", None):
+                    self._webrtc.set_mode(level)  # 实例没有 .mode 属性，需自记档位
+                    self._vad_level = level
+                self._frame_acc = b""
+            except Exception:
+                pass
+        self._env = None
+
     def _process_webrtc_frame(self, frame_bytes):
         dur = self._frame_samples / self.sr
         try:
@@ -3089,11 +3173,16 @@ class _EnergySegmenter:
         except Exception:
             is_speech = False
         arr = np.frombuffer(frame_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        # 最低触发音量门限：用快攻慢放包络而非瞬时 RMS 比较，
+        # 语音里的低能量间隙不会掉门，只有持续低于阈值的噪声才被挡在门外
+        lvl = float(np.sqrt(np.mean(arr * arr))) if len(arr) else 0.0
+        self._env = lvl if self._env is None else max(lvl, 0.85 * self._env + 0.15 * lvl)
+        loud_enough = self._env >= self.min_rms
         if not self._in_speech:
             self._preroll_buf.append(arr)
             if len(self._preroll_buf) > self._preroll_n:
                 del self._preroll_buf[:-self._preroll_n]
-            if is_speech:
+            if is_speech and loud_enough:
                 self._speech_run += dur
                 if self._speech_run >= self.min_speech:
                     self._in_speech = True
@@ -3104,6 +3193,7 @@ class _EnergySegmenter:
             else:
                 self._speech_run = max(0.0, self._speech_run - 1.2 * dur)
         else:
+            # 起段后只看 WebRTC：不在续段上叠能量否决，避免正常说话被掐断
             self._seg_buf.append(arr)
             if is_speech:
                 self._sil_run = 0.0
@@ -3178,6 +3268,7 @@ class _EnergySegmenter:
         self._buf = []
         self._preroll_buf.clear()
         self._frame_acc = b""
+        self._env = None
         self._in_speech = False
         self.in_speech = False
         self._speech_run = 0.0
@@ -3387,6 +3478,8 @@ class SettingsDialog(QDialog):
         for tid, tinfo in THEMES.items():
             self.theme_combo.addItem(tinfo["name"], tid)
         cur_theme = self._cfg.get("theme", "apple")
+        if cur_theme not in THEMES:
+            cur_theme = "apple"
         for i in range(self.theme_combo.count()):
             if self.theme_combo.itemData(i) == cur_theme:
                 self.theme_combo.setCurrentIndex(i)
@@ -3394,17 +3487,36 @@ class SettingsDialog(QDialog):
         self.theme_combo.setToolTip("切换整体强调色（按钮、焦点、选中态等）")
         layout_form.addRow("配色主题:", self.theme_combo)
 
+        # 自定义颜色：选中“自定义颜色…”时可用；选色后整套 UI（含壁纸）跟随
+        self._custom_accent = self._cfg.get("custom_accent", "") or ""
+        # 记下进入对话框时的配色，取消时还原试色结果
+        self._orig_theme = self._cfg.get("theme", "apple")
+        self._orig_appearance = self._cfg.get("appearance", "system")
+        self._orig_accent = THEMES["custom"]["accent"]
+        self._previewed = False
+        self.custom_color_btn = QPushButton("选择颜色…")
+        self.custom_color_btn.setToolTip("任选一种颜色作为主题色（按钮、焦点、电平条、壁纸都会跟随）")
+        self.custom_color_btn.clicked.connect(self._pick_custom_color)
+        self.theme_combo.currentIndexChanged.connect(self._sync_custom_color_row)
+        layout_form.addRow("自定义颜色:", self.custom_color_btn)
+        self._sync_custom_color_row()
+
         # 外观模式（跟随系统 / 浅色 / 深色）
         self.appearance_combo = AnimatedComboBox()
         for aid, aname in APPEARANCES.items():
             self.appearance_combo.addItem(aname, aid)
         cur_appearance = self._cfg.get("appearance", "system")
+        if cur_appearance not in APPEARANCES:
+            cur_appearance = "system"
         for i in range(self.appearance_combo.count()):
             if self.appearance_combo.itemData(i) == cur_appearance:
                 self.appearance_combo.setCurrentIndex(i)
                 break
         self.appearance_combo.setToolTip("跟随 Windows 系统深浅色，或手动指定")
         layout_form.addRow("外观模式:", self.appearance_combo)
+        # 切换主题/外观立即预览（所见即所得），点“取消”会还原
+        self.theme_combo.currentIndexChanged.connect(self._preview_theme)
+        self.appearance_combo.currentIndexChanged.connect(self._preview_theme)
 
         # 行为选项
         self.autostart_chk = QCheckBox("开机自动启动")
@@ -3547,6 +3659,57 @@ class SettingsDialog(QDialog):
         btn_row.addWidget(cancel_btn)
         layout.addLayout(btn_row)
 
+    def _sync_custom_color_row(self, *_):
+        """只有选中“自定义颜色…”才启用色块；色块显示实际会生效的主题色。"""
+        is_custom = self.theme_combo.currentData() == "custom"
+        accent = set_custom_accent(self._custom_accent)
+        self.custom_color_btn.setEnabled(is_custom)
+        self.custom_color_btn.setText(accent.upper())
+        self.custom_color_btn.setStyleSheet(
+            "QPushButton { background-color: %s; color: #ffffff; border: none;"
+            " border-radius: 10px; padding: 6px 14px; font-weight: 600; }"
+            "QPushButton:disabled { color: rgba(255, 255, 255, 0.85); }" % accent
+        )
+
+    def _preview_theme(self):
+        """把当前选择实时套到主窗口（试色所见即所得），取消时还原。"""
+        main = self.parent()
+        if isinstance(main, MainWindow):
+            theme = self.theme_combo.currentData() or "apple"
+            appearance = self.appearance_combo.currentData() or "system"
+            main._apply_theme(theme, appearance)
+            main._appearance = appearance
+            self._previewed = True
+
+    def _pick_custom_color(self):
+        start = set_custom_accent(self._custom_accent)
+        dlg = QColorDialog(QColor(start), self)
+        dlg.setWindowTitle("选择主题颜色")
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        sel = dlg.selectedColor()
+        if not sel.isValid():
+            return
+        self._custom_accent = sel.name()
+        set_custom_accent(self._custom_accent)
+        self._sync_custom_color_row()
+        # 已选中“自定义颜色…”时立刻预览
+        if self.theme_combo.currentData() == "custom":
+            self._preview_theme()
+
+    def reject(self):
+        """取消/关闭：还原进入对话框时的配色试样，不留残留。"""
+        try:
+            if self._custom_accent and set_custom_accent(self._custom_accent) != self._orig_accent:
+                THEMES["custom"]["accent"] = self._orig_accent
+            main = self.parent()
+            if self._previewed and isinstance(main, MainWindow):
+                main._apply_theme(self._orig_theme, self._orig_appearance)
+                main._appearance = self._orig_appearance
+        except Exception:
+            pass
+        super().reject()
+
     def _on_save(self):
         self._cfg["layout_mode"] = "landscape" if self.landscape_radio.isChecked() else "portrait"
         self._cfg["font_size"] = self.font_size_slider.value()
@@ -3565,6 +3728,7 @@ class SettingsDialog(QDialog):
         self._cfg["filter_fillers"] = self.filter_filler_chk.isChecked()
         self._cfg["theme"] = self.theme_combo.currentData() or "apple"
         self._cfg["appearance"] = self.appearance_combo.currentData() or "system"
+        self._cfg["custom_accent"] = set_custom_accent(self._custom_accent)
         self.accept()
 
     def get_config(self):
@@ -3637,7 +3801,7 @@ class VoiceEngine(QObject):
         seg = getattr(self, "_segmenter", None)
         if seg is not None:
             # 与 _init_models 创建分段器时的映射口径保持一致
-            seg.min_rms = self._vad_threshold
+            seg.set_min_rms(self._vad_threshold)  # 阈值 + WebRTC 判定档位一起换
             seg.min_speech = max(0.15, self._min_speech_duration * 0.8)
             seg.min_silence = max(0.25, self._min_silence_duration * 0.9)
             seg.max_speech = self._max_speech_duration
@@ -3807,6 +3971,14 @@ class VoiceEngine(QObject):
             self.status.emit("正在识别...")
             audio_data = b"".join(self._ptt_buffer)
             samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+            # 最低触发音量同样约束 PTT：最响的 0.3 秒都不到阈值 = 基本没说话
+            peak_rms = _loudest_rms(samples, SAMPLE_RATE)
+            if peak_rms < self._vad_threshold:
+                self.status.emit(
+                    "音量太小，未识别（最高 %.3f < 阈值 %.3f）。"
+                    "可在设置里调低“最低触发音量”" % (peak_rms, self._vad_threshold)
+                )
+                return
             samples = _maybe_denoise(self, samples)
 
             stream = self._recognizer.create_stream()
@@ -4531,10 +4703,18 @@ class MainWindow(QMainWindow):
         )
         # 降噪开关同步到两个引擎
         self.voice._enable_denoiser = self._enable_denoiser
+        # 电平条上的阈值箭头同步：设置里改/启动加载配置后箭头要跟着走，
+        # 否则值已生效但界面还停在旧位置，看着就像“调了没用”
+        if hasattr(self, "mic_meter"):
+            self.mic_meter.set_threshold(self._vad_threshold)
         # 悬浮翻译引擎同步音量阈值
         if hasattr(self, "speaker_engine"):
             self.speaker_engine._min_rms = self._vad_threshold
             self.speaker_engine._enable_denoiser = self._enable_denoiser
+            # 已在运行的悬浮翻译持有自己的分段器，必须一起改，否则调了不生效
+            sp_seg = getattr(self.speaker_engine, "_segmenter", None)
+            if sp_seg is not None:
+                sp_seg.set_min_rms(self._vad_threshold)
 
     def eventFilter(self, obj, event):
         if obj is self.text_input and event.type() == event.KeyPress:
@@ -4808,6 +4988,13 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------
     def _open_settings(self):
         cfg = self._get_current_config()
+        # 进对话框前的配色基线：对话框里的实时预览会改到 self._theme，
+        # 所以“颜色有没有改”必须跟开窗前的快照比，不能跟当前内存状态比
+        base_color = (
+            cfg.get("theme", "apple"),
+            cfg.get("appearance", "system"),
+            cfg.get("custom_accent", ""),
+        )
         dlg = SettingsDialog(cfg, self)
         # 对话框里的下拉框也套弹层美化（透明四角/去黑边）
         self._polish_combo_popups()
@@ -4842,10 +5029,18 @@ class MainWindow(QMainWindow):
                 self.denoiser_home_chk.blockSignals(True)
                 self.denoiser_home_chk.setChecked(self._enable_denoiser)
                 self.denoiser_home_chk.blockSignals(False)
-            # 配色主题 + 外观模式
+            # 配色主题 + 外观模式（与进对话框前的基线比）
             new_theme = new_cfg.get("theme", "apple")
+            if new_theme not in THEMES:
+                new_theme = "apple"
             new_appearance = new_cfg.get("appearance", "system")
-            if new_theme != self._theme or new_appearance != self._appearance:
+            if new_appearance not in APPEARANCES:
+                new_appearance = "system"
+            set_custom_accent(new_cfg.get("custom_accent", ""))
+            color_changed = (
+                (new_theme, new_appearance, new_cfg.get("custom_accent", "")) != base_color
+            )
+            if color_changed:
                 self._apply_theme(new_theme, new_appearance)
             self._appearance = new_appearance
 
@@ -4866,7 +5061,9 @@ class MainWindow(QMainWindow):
 
             if old_mode != self._layout_mode:
                 self._apply_layout()
-            self._save_config()
+            # 配色只在真的改了时才写回；没动颜色就一个字节都不覆盖，
+            # 保持“没改过 = 苹果蓝 + 跟随系统”的初始状态
+            self._save_config(include_color=color_changed)
             self.status_bar.showMessage("设置已保存并应用")
 
     def _get_current_config(self):
@@ -4881,6 +5078,7 @@ class MainWindow(QMainWindow):
             "layout_mode": self._layout_mode,
             "theme": getattr(self, "_theme", "apple"),
             "appearance": getattr(self, "_appearance", "system"),
+            "custom_accent": THEMES["custom"]["accent"],
             "font_size": self._font_size,
             "vad_threshold": self._vad_threshold,
             "min_silence_duration": self._min_silence_duration,
@@ -5697,8 +5895,13 @@ class MainWindow(QMainWindow):
                     self.hotkey_chk.setChecked(True)
                 # 加载布局和参数设置
                 self._layout_mode = cfg.get("layout_mode", "portrait")
-                self._theme = cfg.get("theme", "apple")
-                self._appearance = cfg.get("appearance", "system")
+                # 默认口径：首次打开 / 配置里没有 / 值非法 → 一律苹果蓝 + 跟随系统
+                _th = cfg.get("theme", "apple")
+                self._theme = _th if _th in THEMES else "apple"
+                _ap = cfg.get("appearance", "system")
+                self._appearance = _ap if _ap in APPEARANCES else "system"
+                # 自定义主题色（必须在首次 _apply_theme 之前注入）
+                set_custom_accent(cfg.get("custom_accent", ""))
                 self._font_size = cfg.get("font_size", 10)
                 # 音量阈值（RMS）：旧版灵敏度值 0.1~0.9 迁移为 0.02
                 _vt = cfg.get("vad_threshold", 0.02)
@@ -5743,9 +5946,22 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _save_config(self):
+    def _save_config(self, include_color=False):
+        """写配置。
+
+        include_color 默认 False：theme / appearance / custom_accent 三个颜色键
+        **只在设置里真的改了颜色时**才写（见 _open_settings），其余保存场景
+        （退出、改阈值、切托盘开关…）一律不碰它们 —— 于是没动过颜色的配置
+        文件里根本没有这三个键，下次启动回落到默认：苹果蓝 + 跟随系统。
+        合并写入，不覆盖文件里已有的其它键。
+        """
         try:
-            cfg = {
+            # 以 _get_current_config 为底（行为开关/设备/几何/自定义色都在里面），
+            # 再补主界面输入控件的项。旧版只写自己那一小份，会把 autostart、
+            # filter_fillers、engine_type、speaker_* 等键从配置文件里抹掉，
+            # 表现就是“设置明明保存了，重启又变回默认”。
+            cfg = self._get_current_config()
+            cfg.update({
                 "ip": self.ip_edit.text().strip(),
                 "port": int(self.port_edit.text().strip()),
                 "immediate": self.immediate_chk.isChecked(),
@@ -5757,22 +5973,25 @@ class MainWindow(QMainWindow):
                 "hotkey_name": self._hotkey_name,
                 "hotkey_scan_code": self._hotkey_scan_code,
                 "hotkey_mode": self._hotkey_mode,
-                "layout_mode": self._layout_mode,
-            "theme": getattr(self, "_theme", "apple"),
-            "appearance": getattr(self, "_appearance", "system"),
-                "font_size": self._font_size,
-                "vad_threshold": self._vad_threshold,
-                "min_silence_duration": self._min_silence_duration,
-                "min_speech_duration": self._min_speech_duration,
-                "max_chars": self._max_chars,
-                "translate_enabled": self.translate_chk.isChecked(),
-                "translate_target": self.translate_lang_combo.currentData() or "en",
-                "translate_mode": self.translate_mode_combo.currentData() or "bilingual",
-                "baidu_appid": self.translator._baidu_appid,
-                "baidu_secret": self.translator._baidu_secret,
-            }
+                "filter_fillers": bool(FILTER_FILLERS),
+                "custom_accent": THEMES["custom"]["accent"],
+            })
+            if not include_color:
+                for k in ("theme", "appearance", "custom_accent"):
+                    cfg.pop(k, None)
+            # 合并写入：只覆盖本次提供的键，文件里其它键（含未来版本新增的）一律保留
+            old = {}
+            if os.path.exists(CONFIG_FILE):
+                try:
+                    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                        old = json.load(f)
+                except Exception:
+                    old = {}
+            if not isinstance(old, dict):
+                old = {}
+            old.update(cfg)
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+                json.dump(old, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
